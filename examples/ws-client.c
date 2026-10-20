@@ -1,0 +1,288 @@
+/*!
+ *  @file libxutils/examples/ws-client.c
+ *
+ *  This source is part of the "libxutils" project
+ *  2015-2023  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief Implementation of high performance event based non-blocking WebSocket/TLS client.
+ * The library will use poll(), WSAPoll(), or epoll() depending on the operating system.
+ */
+
+#include "xstd.h"
+#include "xver.h"
+#include "log.h"
+#include "sig.h"
+#include "cli.h"
+#include "addr.h"
+#include "api.h"
+
+static xbool_t g_bFinish = XFALSE;
+
+/* Unique for all sessions */
+typedef struct {
+    size_t nRxCount;
+    size_t nTxCount;
+
+    /*
+        Session related stuff...
+    */
+} session_data_t;
+
+void signal_callback(int sig)
+{
+    if (sig == SIGPIPE) return;
+    else if (sig == SIGINT) printf("\n");
+    g_bFinish = XTRUE;
+}
+
+int print_status(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    int nFD = pSession ? (int)pSession->sock.nFD : XSTDERR;
+    const char *pStr = XAPI_GetStatus(pCtx);
+
+    xlogn("%s: fd(%d)", pStr, nFD);
+    return XAPI_CONTINUE;
+}
+
+int print_error(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    int nFD = pSession ? (int)pSession->sock.nFD : XSTDERR;
+
+    char sStatus[XSTR_MIN];
+    XAPI_DescribeStatus(pCtx, sStatus, sizeof(sStatus));
+
+    xloge("%s: fd(%d)", sStatus, nFD);
+    return XAPI_CONTINUE;
+}
+
+int handshake_request(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    xhttp_t *pHandle = (xhttp_t*)pSession->pPacket;
+
+    xlogn("Sending handhshake request: fd(%d), uri(%s), buff(%zu)",
+        (int)pSession->sock.nFD, pHandle->sUri, pHandle->rawData.nUsed);
+
+    char *pHeader = XHTTP_GetHeaderRaw(pHandle);
+    if (pHeader != NULL)
+    {
+        xlogi("Raw request header:\n\n%s", pHeader);
+        free(pHeader);
+    }
+
+    return XAPI_CONTINUE;
+}
+
+int handshake_response(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    xhttp_t *pHandle = (xhttp_t*)pSession->pPacket;
+
+    xlogn("Received handhshake response: fd(%d), buff(%zu)",
+        (int)pSession->sock.nFD, pHandle->rawData.nUsed);
+
+    char *pHeader = XHTTP_GetHeaderRaw(pHandle);
+    if (pHeader != NULL)
+    {
+        xlogi("Raw answer response:\n\n%s", pHeader);
+        free(pHeader);
+    }
+
+    return XAPI_CONTINUE;
+}
+
+int send_pong(xapi_session_t *pSession, const uint8_t *pPayload, size_t nLength)
+{
+    xbyte_buffer_t *pTxBuffer = XAPI_GetTxBuff(pSession);
+
+    /* A client masks what it sends, and a pong carries the data of the ping it answers (RFC 6455, 5.5.3) */
+    xws_status_t status = XWS_WriteFrame(pTxBuffer, pPayload, nLength, XWS_PONG, XTRUE, XTRUE);
+    if (status != XWS_ERR_NONE)
+    {
+        xloge("Failed to create WS PONG frame: %s",
+            XWebSock_GetStatusStr(status));
+
+        return XAPI_DISCONNECT;
+    }
+
+    xlogn("Sending PONG: fd(%d), buff(%zu)",
+        (int)pSession->sock.nFD, pTxBuffer->nUsed);
+
+    return XAPI_EnableEvent(pSession, XPOLLOUT);
+}
+
+int handle_frame(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    xws_frame_t *pFrame = (xws_frame_t*)pSession->pPacket;
+    session_data_t *pSessionData = (session_data_t*)pSession->pSessionData;
+
+    xlogn("Received WS frame: fd(%d), type(%s), fin(%s), hdr(%zu), pl(%zu), buff(%zu)",
+        (int)pSession->sock.nFD, XWS_FrameTypeStr(pFrame->eType), pFrame->bFin?"true":"false",
+        pFrame->nHeaderSize, pFrame->nPayloadLength, pFrame->buffer.nUsed);
+
+    if (pFrame->eType == XWS_PING)
+    {
+        const uint8_t *pPing = XWebFrame_GetPayload(pFrame);
+        size_t nLength = pPing != NULL ? XWebFrame_GetPayloadLength(pFrame) : 0;
+
+        pSessionData->nRxCount++;
+        pSessionData->nTxCount++;
+        return send_pong(pSession, pPing, nLength);
+    }
+
+    /* Received close request, we should destroy this session */
+    if (pFrame->eType == XWS_CLOSE) return XAPI_DISCONNECT;
+    const char* pPayload = (const char*)XWebFrame_GetPayload(pFrame);
+
+    if (pPayload && pFrame->eType == XWS_TEXT)
+        xlogn("WS frame payload: %s", pPayload);
+
+    pSessionData->nRxCount++;
+    return XAPI_EnableEvent(pSession, XPOLLOUT);
+}
+
+int send_request(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    session_data_t *pSessionData = (session_data_t*)pSession->pSessionData;
+    xbyte_buffer_t *pTxBuffer = XAPI_GetTxBuff(pSession);
+
+    char sPayload[XSTR_MIN];
+    XCLI_GetInput("Enter message: ", sPayload, sizeof(sPayload), XTRUE);
+
+    size_t nLength = strlen(sPayload);
+    if (!nLength) return XAPI_NO_ACTION;
+
+    /* The frame is masked and written straight into the session's send buffer */
+    xws_status_t status = XWS_WriteFrame(pTxBuffer, (const uint8_t*)sPayload, nLength, XWS_TEXT, XTRUE, XTRUE);
+    if (status != XWS_ERR_NONE)
+    {
+        xloge("Failed to create WS frame: %s",
+            XWebSock_GetStatusStr(status));
+
+        return XAPI_DISCONNECT;
+    }
+
+    xlogn("Sending message: fd(%d), buff(%zu)",
+        (int)pSession->sock.nFD, pTxBuffer->nUsed);
+    xlogn("Message payload: %s", sPayload);
+
+    pSessionData->nTxCount++;
+    return XAPI_EnableEvent(pSession, XPOLLOUT);
+}
+
+int init_session(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    xlogn("Client connected to server: fd(%d) %s:%u",
+        (int)pSession->sock.nFD, pSession->sAddr, pSession->nPort);
+
+    session_data_t *pSessionData = (session_data_t*)pSession->pSessionData;
+    pSessionData->nRxCount = 0;
+    pSessionData->nTxCount = 0;
+
+    return XAPI_SetEvents(pSession, XPOLLIO);
+}
+
+int destroy_session(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    session_data_t *pSessionData = (session_data_t*)pSession->pSessionData;
+    xlogn("Connection closed: fd(%d)", (int)pSession->sock.nFD);
+
+    xlogi("Frame statistics: rx(%d), tx(%d)",
+        pSessionData->nRxCount, pSessionData->nTxCount);
+
+    g_bFinish = XTRUE;
+    return XAPI_DISCONNECT;
+}
+
+int service_callback(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    switch (pCtx->eCbType)
+    {
+        case XAPI_CB_HANDSHAKE_REQUEST:
+            return handshake_request(pCtx, pSession);
+        case XAPI_CB_HANDSHAKE_RESPONSE:
+            return handshake_response(pCtx, pSession);
+        case XAPI_CB_CONNECTED:
+            return init_session(pCtx, pSession);
+        case XAPI_CB_CLOSED:
+            return destroy_session(pCtx, pSession);
+        case XAPI_CB_READ:
+            return handle_frame(pCtx, pSession);
+        case XAPI_CB_WRITE:
+            return send_request(pCtx, pSession);
+        case XAPI_CB_ERROR:
+            return print_error(pCtx, pSession);
+        case XAPI_CB_STATUS:
+            return print_status(pCtx, pSession);
+        case XAPI_CB_COMPLETE:
+            xlogn("TX complete: fd(%d)", (int)pSession->sock.nFD);
+            break;
+        case XAPI_CB_INTERRUPT:
+            if (g_bFinish) return XAPI_DISCONNECT;
+            break;
+        default:
+            break;
+    }
+
+    return XAPI_CONTINUE;
+}
+
+int main(int argc, char* argv[])
+{
+    xlog_defaults();
+    xlog_timing(XLOG_TIME);
+    xlog_setfl(XLOG_ALL);
+    xlog_indent(XTRUE);
+
+    int nSignals[3];
+    nSignals[0] = SIGTERM;
+    nSignals[1] = SIGINT;
+    nSignals[2] = SIGPIPE;
+    XSig_Register(nSignals, 3, signal_callback);
+
+    if (argc < 2)
+    {
+        xlog("Usage: %s [ws/wss-url]", argv[0]);
+        xlog("Example: %s ws://127.0.0.1:6969/websock", argv[0]);
+        return 1;
+    }
+
+    xapi_t api;
+    XAPI_Init(&api, service_callback, &api);
+
+    xlink_t link;
+    if (XLink_Parse(&link, argv[1]) < 0 || !link.nPort)
+    {
+        xloge("Failed to parse link: %s", argv[1]);
+        xlogi("Example: ws://127.0.0.1:6969/websock");
+
+        XAPI_Destroy(&api);
+        return XSTDERR;
+    }
+
+    xapi_endpoint_t endpt;
+    XAPI_InitEndpoint(&endpt);
+
+    endpt.eType = XAPI_WS;
+    endpt.eRole = XAPI_CLIENT;
+    endpt.pAddr = link.sAddr;
+    endpt.nPort = link.nPort;
+    endpt.pUri = link.sUri;
+    endpt.bTLS = xstrcmp(link.sProtocol, "wss");
+
+    session_data_t sessData;
+    endpt.pSessionData = &sessData;
+
+    if (XAPI_AddEndpoint(&api, &endpt) < 0)
+    {
+        XAPI_Destroy(&api);
+        return XSTDERR;
+    }
+
+    while (!g_bFinish)
+    {
+        xevent_status_t status = XAPI_Service(&api, 100);
+        if (status != XEVENTS_SUCCESS) break;
+    }
+
+    XAPI_Destroy(&api);
+    return 0;
+}

@@ -1,0 +1,107 @@
+# event.c
+
+## Purpose
+
+Cross-platform event loop over `epoll`, `poll` or `WSAPoll`, with timer support.
+
+## System Errors
+
+Every operation that returns a status starts by clearing `pEvents->nSysError`. When it fails in a system call (`epoll_create1()`, `epoll_ctl()`, `epoll_wait()`, `poll()`, `WSAPoll()`, `eventfd()`, `timerfd_create()`, `timerfd_settime()`), the error of that call (`errno`, `WSAGetLastError()` on Windows) is saved there right away, before a log line or a cleanup can change it. The returned status says what failed, `nSysError` why; it stays 0 for argument errors and other failures that are no system call. `XSock_SysErrorStr()` writes its text. The Linux timers can be extended without the engine (`NULL`), they keep no error then.
+
+## API Reference
+
+### Status / byte helpers
+
+#### `const char *XEvents_GetStatusStr(xevent_status_t status)`
+
+- Returns static text for event status code.
+
+#### `int XEvent_WriteByte(xevent_data_t *pData, const char cVal)`
+
+#### `int XEvent_ReadByte(xevent_data_t *pData, char *pVal)`
+
+#### `int XEvent_ReadU64(xevent_data_t *pData, uint64_t *pVal)`
+
+- Read/write eventfd/timerfd-style payload bytes.
+- Return OS read/write status or negative error.
+
+### Lifecycle
+
+#### `xevent_status_t XEvents_Create(xevents_t *pEvents, uint32_t nMax, void *pUser, xevent_cb_t callBack, xbool_t bUseHash)`
+
+- Initializes event arrays, callback and optional fd hash map.
+- Returns `XEVENTS_SUCCESS` or failure status.
+
+#### `void XEvents_Destroy(xevents_t *pEvents)`
+
+- Frees arrays, timers and registered-event state.
+
+### Event data creation
+
+#### `xevent_data_t *XEvents_NewData(void *pCtx, XSOCKET nFd, int nType)`
+
+- Allocates one event-data object.
+- Returns object or `NULL`.
+
+#### `xevent_data_t *XEvents_GetData(xevents_t *pEvents, XSOCKET nFd)`
+
+- Returns registered data for fd or `NULL`.
+
+#### `xevent_data_t *XEvents_CreateEvent(xevents_t *pEvents, void *pCtx)`
+
+- Creates a manual/eventfd-style event source when supported.
+- Returns event data or `NULL`.
+
+#### `xevent_data_t *XEvents_AddTimer(xevents_t *pEvents, void *pContext, int nTimeoutMs)`
+
+- Creates and registers timer event.
+- Where timers are kept in the event list (`poll`/`WSAPoll` builds: macOS and Windows), they are ordered by
+  deadline and measured on the monotonic clock (`XTime_GetMonoMs()`), so a change of the system time neither
+  fires them early nor holds them back. On Linux they are `timerfd`s, which the kernel already runs on a
+  monotonic clock.
+- Returns timer handle or `NULL`.
+
+#### `xevent_status_t XEvents_ExtendTimer(xevents_t *pEvents, xevent_data_t *pTimer, int nTimeoutMs)`
+
+- Rearms timer.
+- Returns success/failure status.
+
+### Register / modify / delete
+
+#### `xevent_data_t *XEvents_RegisterEvent(xevents_t *pEvents, void *pCtx, XSOCKET nFd, int nEvents, int nType)`
+
+- Allocates event data and registers it.
+- Returns event handle or `NULL`.
+
+#### `xevent_status_t XEvents_Add(xevents_t *pEvents, xevent_data_t *pData, int nEvents)`
+
+#### `xevent_status_t XEvents_Modify(xevents_t *pEvents, xevent_data_t *pData, int nEvents)`
+
+#### `xevent_status_t XEvents_Delete(xevents_t *pEvents, xevent_data_t *pData)`
+
+- Add/change/remove watched fd or timer.
+- Return `XEVENTS_SUCCESS` or specific failure status.
+- Delete a descriptor while it is still open. epoll forgets a registration only
+  once every copy of the descriptor is closed, so one closed first - while a
+  forked child still holds a copy - stays registered with a pointer to the
+  event data `XEvents_Delete` frees. XAPI keeps its sockets open until they
+  have been deleted (see `XSOCK_KEEPOPEN` in [sock.md](sock.md)).
+
+#### `xevent_status_t XEvents_Suspend(xevents_t *pEvents, xevent_data_t *pData)`
+
+#### `xevent_status_t XEvents_Resume(xevents_t *pEvents, xevent_data_t *pData, int nEvents)`
+
+- Take a registered descriptor out of polling and put it back, its event data untouched.
+- `XEvents_Modify()` cannot do this for a descriptor added with `EPOLLEXCLUSIVE`: epoll lets such a
+  registration be removed and added again, not changed. Pass `XEvents_Resume()` the events the descriptor
+  was registered with, `EPOLLEXCLUSIVE` included.
+
+### Service loop
+
+#### `xevent_status_t XEvents_Service(xevents_t *pEvents, int nTimeoutMs)`
+
+- Waits for events, dispatches callbacks and processes timer expiry.
+- Returns:
+  - `XEVENTS_SUCCESS` on a normal cycle, including plain timeout/no events.
+  - `XEVENTS_EINTR`-family behavior only via callback/interrupt path.
+  - other `xevent_status_t` values on backend or callback-driven termination.

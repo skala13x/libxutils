@@ -1,0 +1,661 @@
+/*!
+ *  @file libxutils/src/sys/srch.c
+ *
+ *  This source is part of the "libxutils" project
+ *  2015-2020  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief Advanced file search implementation.
+ */
+
+#include "srch.h"
+
+typedef struct {
+    const char *pBuffer;
+    const char *pPath;
+    const char *pName;
+    xstat_t *pStat;
+    size_t nLength;
+    size_t nPosit;
+} xsearch_context_t;
+
+void XSearch_InitEntry(xsearch_entry_t *pEntry)
+{
+    XCHECK_VOID_NL((pEntry != NULL));
+    pEntry->sPath[0] = XSTR_NUL;
+    pEntry->sName[0] = XSTR_NUL;
+    pEntry->sLink[0] = XSTR_NUL;
+    pEntry->sLine[0] = XSTR_NUL;
+    pEntry->eType = XF_UNKNOWN;
+    pEntry->pRealPath = NULL;
+    pEntry->nLinkCount = 0;
+    pEntry->nLineNum = 0;
+    pEntry->nTime = 0;
+    pEntry->nSize = 0;
+    pEntry->nGID = 0;
+    pEntry->nUID = 0;
+    pEntry->nMode = 0;
+}
+
+void XSearch_CreateEntry(xsearch_entry_t *pEntry, const char *pName, const char *pPath, xstat_t *pStat)
+{
+    XCHECK_VOID_NL((pEntry != NULL));
+    XSearch_InitEntry(pEntry);
+
+    if (pName != NULL) xstrncpy(pEntry->sName, sizeof(pEntry->sName), pName);
+    if (pPath != NULL) xstrncpy(pEntry->sPath, sizeof(pEntry->sPath), pPath);
+
+    if (pStat != NULL)
+    {
+        XPath_ModeToPerm(pEntry->sPerm, sizeof(pEntry->sPerm), pStat->st_mode);
+        pEntry->eType = XFile_GetType(pStat->st_mode);
+        pEntry->nLinkCount = pStat->st_nlink;
+        pEntry->nTime = pStat->st_mtime;
+        pEntry->nSize = pStat->st_size;
+        pEntry->nGID = pStat->st_gid;
+        pEntry->nUID = pStat->st_uid;
+        pEntry->nMode = pStat->st_mode;
+    }
+
+#ifndef _WIN32
+    if (pEntry->eType == XF_SYMLINK && pName != NULL && pPath != NULL)
+    {
+        char sPath[XPATH_MAX];
+        xstrncpyf(sPath, sizeof(sPath), "%s%s", pPath, pName);
+
+        int nLen = readlink(sPath, pEntry->sLink, sizeof(pEntry->sLink)-1);
+        if (nLen < 0) nLen = 0;
+
+        pEntry->sLink[nLen] = XSTR_NUL;
+        pEntry->pRealPath = realpath(sPath, NULL);
+    }
+#endif
+}
+
+xsearch_entry_t* XSearch_AllocEntry()
+{
+    xsearch_entry_t *pEntry = (xsearch_entry_t*)malloc(sizeof(xsearch_entry_t));
+    if (pEntry == NULL) return NULL;
+
+    XSearch_InitEntry(pEntry);
+    return pEntry;
+}
+
+xsearch_entry_t* XSearch_NewEntry(const char *pName, const char *pPath, xstat_t *pStat)
+{
+    xsearch_entry_t *pEntry = (xsearch_entry_t*)malloc(sizeof(xsearch_entry_t));
+    if (pEntry == NULL) return NULL;
+
+    XSearch_CreateEntry(pEntry, pName, pPath, pStat);
+    return pEntry;
+}
+
+void XSearch_FreeEntry(xsearch_entry_t *pEntry)
+{
+    if (pEntry != NULL)
+    {
+        if (pEntry->pRealPath != NULL)
+            free(pEntry->pRealPath);
+
+        free(pEntry);
+    }
+}
+
+static void XSearch_ArrayClearCb(xarray_data_t *pItem)
+{
+    if (pItem == NULL) return;
+    XSearch_FreeEntry((xsearch_entry_t*)pItem->pData);
+}
+
+static int XSearch_ErrorCallback(xsearch_t *pSearch, const char *pStr, ...)
+{
+    if (pSearch == NULL) return XSTDERR;
+    else if (pSearch->callback == NULL) return XSTDOK;
+
+    char sMessage[XSTR_BIG];
+    va_list args;
+
+    va_start(args, pStr);
+    xstrncpyarg(sMessage, sizeof(sMessage), pStr, args);
+    va_end(args);
+
+    if (pSearch->callback(pSearch, NULL, sMessage) < 0)
+    {
+        XSYNC_ATOMIC_SET(pSearch->pInterrupted, 1);
+        return XSTDERR;
+    }
+
+    return XSTDOK;
+}
+
+static int XSearch_Callback(xsearch_t *pSearch, xsearch_entry_t *pEntry)
+{
+    if (pSearch == NULL || pEntry == NULL) return XSTDERR;
+
+    int nReturnValue = (pSearch->callback != NULL) ?
+        pSearch->callback(pSearch, pEntry, NULL) : XSTDOK;
+
+    if (nReturnValue > 0)
+    {
+        xarray_data_t *pItem = XArray_NewData(&pSearch->fileArray, pEntry, 0, 0);
+        if (pItem == NULL)
+        {
+            XSearch_ErrorCallback(pSearch, "Failed to append entry: %s%s", pEntry->sPath, pEntry->sName);
+            XSearch_FreeEntry(pEntry);
+            return XSTDERR;
+        }
+
+        /* A failed add releases the item, and the entry with it */
+        if (XArray_Add(&pSearch->fileArray, pItem) < 0)
+        {
+            XSearch_ErrorCallback(pSearch, "Failed to append entry");
+            return XSTDERR;
+        }
+
+        return XSTDOK;
+    }
+    else if (nReturnValue < 0)
+    {
+        XSYNC_ATOMIC_SET(pSearch->pInterrupted, 1);
+        XSearch_FreeEntry(pEntry);
+        return XSTDERR;
+    }
+
+    XSearch_FreeEntry(pEntry);
+    return XSTDNON;
+}
+
+static xbool_t XSearch_Multy(xarray_t *pTokens, const char *pName, size_t nLength)
+{
+    size_t i, nCount = XArray_Used(pTokens);
+    xbool_t bFound = XFALSE;
+
+    for (i = 0; i < nCount; i++)
+    {
+        xarray_data_t *pArrData = XArray_Get(pTokens, i);
+        if (pArrData == NULL || pArrData->pData == NULL || !pArrData->nSize) continue;
+
+        const char *pToken = (const char *)pArrData->pData;
+        size_t nTokenLength = pArrData->nSize - 1;
+
+        bFound = xstrnmatch(pName, nLength, pToken, nTokenLength);
+        if (bFound) break;
+    }
+
+    return bFound;
+}
+
+static xbool_t XSearch_Name(xsearch_t *pSearch, const char *pFileName)
+{
+    size_t nLength = strlen(pFileName);
+    xarray_t *pNames = &pSearch->nameTokens;
+    if (!pNames->nUsed) return xstrmatch(pFileName, nLength, pSearch->sName);
+    return XSearch_Multy(&pSearch->nameTokens, pFileName, nLength);
+}
+
+static XSTATUS XSearch_Lines(xsearch_t *pSearch, xsearch_context_t *pCtx)
+{
+    XSTATUS nStatus = XSTDNON;
+    xarray_t *pArr = xstrsplite(pCtx->pBuffer, XSTR_NEW_LINE);
+
+    if (pArr != NULL)
+    {
+        size_t i = 0;
+        for (i = 0; i < pArr->nUsed; i++)
+        {
+            char *pLine = (char*)XArray_GetData(pArr, i);
+            if (xstrsrc(pLine, pSearch->sText) >= 0)
+            {
+                xsearch_entry_t *pEntry = XSearch_NewEntry(pCtx->pName, pCtx->pPath, pCtx->pStat);
+                if (pEntry == NULL)
+                {
+                    XSearch_ErrorCallback(pSearch, "Failed to alloc entry: %s", pCtx->pPath);
+                    XArray_Destroy(pArr);
+                    return XSTDERR;
+                }
+
+                xstrncpy(pEntry->sLine, sizeof(pEntry->sLine), pLine);
+                pEntry->nLineNum = i + 1;
+                nStatus = XSTDOK;
+
+                if (XSearch_Callback(pSearch, pEntry) < 0)
+                {
+                    XArray_Destroy(pArr);
+                    return XSTDERR;
+                }
+            }
+        }
+    }
+
+    if (nStatus == XSTDNON)
+    {
+        xsearch_entry_t *pEntry = XSearch_NewEntry(pCtx->pName, pCtx->pPath, pCtx->pStat);
+        if (pEntry == NULL)
+        {
+            XSearch_ErrorCallback(pSearch, "Failed to alloc entry: %s", pCtx->pPath);
+            XArray_Destroy(pArr);
+            return XSTDERR;
+        }
+
+        xstrncpyf(pEntry->sLine, sizeof(pEntry->sLine), "Binary %s matches",
+            pSearch->bReadStdin ? "input" : "file");
+
+        if (XSearch_Callback(pSearch, pEntry) < 0)
+        {
+            XArray_Destroy(pArr);
+            return XSTDERR;
+        }
+    }
+
+    XArray_Destroy(pArr);
+    return XSTDNON;
+}
+
+static XSTATUS XSearch_Buffer(xsearch_t *pSearch, xsearch_context_t *pCtx)
+{
+    const char *pData = pCtx->pBuffer;
+    size_t nLength = pCtx->nLength;
+    XSTATUS nStatus = XSTDNON;
+
+    while (pCtx->nPosit < nLength)
+    {
+        while (pCtx->nPosit > 0 && pData[pCtx->nPosit] != '\n') pCtx->nPosit--;
+        if (pData[pCtx->nPosit] == '\n') pCtx->nPosit++;
+
+        int nEnd = xstrsrc(&pData[pCtx->nPosit], "\n");
+        if (nEnd < 0 && pCtx->nPosit < nLength) nEnd = (int)XSTD_MIN(nLength - pCtx->nPosit, (size_t)INT_MAX);
+        if (nEnd <= 0 || pCtx->nPosit + (size_t)nEnd > nLength) break;
+
+        char sLine[XSTR_MAX];
+        xstrncpys(sLine, sizeof(sLine), &pData[pCtx->nPosit], nEnd);
+
+        xsearch_entry_t *pEntry = XSearch_NewEntry(pCtx->pName, pCtx->pPath, pCtx->pStat);
+        if (pEntry == NULL)
+        {
+            XSearch_ErrorCallback(pSearch, "Failed to alloc entry: %s", pCtx->pPath);
+            return XSTDERR;
+        }
+
+        xstrncpy(pEntry->sLine, sizeof(pEntry->sLine), sLine);
+        if (XSearch_Callback(pSearch, pEntry) < 0) return XSTDERR;
+
+        nStatus = XSTDOK;
+        pCtx->nPosit += nEnd;
+        if (pCtx->nPosit >= nLength) break;
+
+        int nNewPosit = xstrsrc(&pData[pCtx->nPosit], pSearch->sText);
+        if (nNewPosit < 0) break;
+        pCtx->nPosit += nNewPosit;
+    }
+
+    if (nStatus == XSTDNON)
+    {
+        xsearch_entry_t *pEntry = XSearch_NewEntry(pCtx->pName, pCtx->pPath, pCtx->pStat);
+        if (pEntry == NULL)
+        {
+            XSearch_ErrorCallback(pSearch, "Failed to alloc entry: %s", pCtx->pPath);
+            return XSTDERR;
+        }
+
+        xstrncpyf(pEntry->sLine, sizeof(pEntry->sLine), "Binary %s matches",
+            pSearch->bReadStdin ? "input" : "file");
+
+        if (XSearch_Callback(pSearch, pEntry) < 0) return XSTDERR;
+    }
+
+    return XSTDNON;
+}
+
+static XSTATUS XSearch_LoadData(xsearch_t *pSearch, xbyte_buffer_t *pBuffer, const char *pPath, const char *pName)
+{
+    XByteBuffer_Init(pBuffer, XSTDNON, XFALSE);
+
+    if (pSearch->bReadStdin)
+    {
+        XByteBuffer_Init(pBuffer, XSTR_BIG, XFALSE);
+        XByteBuffer_ReadStdin(pBuffer);
+    }
+    else
+    {
+        char sPath[XPATH_MAX];
+        xstrncpyf(sPath, sizeof(sPath), "%s%s", pPath, pName);
+
+        /* Non-blocking: the criteria saw a regular file, but a FIFO swapped in
+           since then would park this thread in open() for good, and whoever
+           joins it with it. XFile_LoadSize re-checks the type on the descriptor. */
+        xfile_t file;
+        if (XFile_Open(&file, sPath, "rni", NULL) >= 0)
+        {
+            size_t nSize = 0;
+            uint8_t *pData = XFile_LoadSize(&file, pSearch->nBufferSize, &nSize);
+            XFile_Close(&file);
+
+            if (pData != NULL)
+            {
+                pBuffer->pData = pData;
+                pBuffer->nUsed = nSize;
+                pBuffer->nSize = nSize + 1;
+            }
+        }
+    }
+
+    return pBuffer->nUsed > 0 ? XSTDOK : XSTDNON;
+}
+
+static XSTATUS XSearch_Text(xsearch_t *pSearch, const char *pPath, const char *pName, xstat_t *pStat)
+{
+    XSTATUS nStatus = XSTDOK;
+    xbyte_buffer_t buffer;
+
+    nStatus = XSearch_LoadData(pSearch, &buffer, pPath, pName);
+    if (nStatus <= XSTDNON)
+    {
+        XByteBuffer_Clear(&buffer);
+        return XSTDNON;
+    }
+
+    /* The whole buffer: a binary file can hold NUL bytes before the text searched for */
+    if (pSearch->bInsensitive)
+    {
+        size_t i;
+        for (i = 0; i < buffer.nUsed; i++)
+            buffer.pData[i] = (uint8_t)tolower(buffer.pData[i]);
+    }
+    int nPosit = xstrsrcb((char*)buffer.pData, buffer.nUsed, pSearch->sText);
+
+    if (nPosit < 0 || nPosit >= (int)buffer.nUsed)
+    {
+        XByteBuffer_Clear(&buffer);
+        return XSTDNON;
+    }
+
+    if (!pSearch->bMatchOnly)
+    {
+        xsearch_context_t ctx;
+        ctx.pBuffer = (char*)buffer.pData;
+        ctx.nLength = buffer.nUsed;
+        ctx.nPosit = nPosit;
+        ctx.pPath = pPath;
+        ctx.pName = pName;
+        ctx.pStat = pStat;
+
+        nStatus = pSearch->bSearchLines ?
+            XSearch_Lines(pSearch, &ctx) :
+            XSearch_Buffer(pSearch, &ctx);
+    }
+
+    XByteBuffer_Clear(&buffer);
+    return nStatus;
+}
+
+static XSTATUS XSearch_CheckCriteria(xsearch_t *pSearch, const char *pPath, const char *pName, xstat_t *pStat)
+{
+    if (pSearch->nLinkCount >= 0 && pSearch->nLinkCount != pStat->st_nlink) return XSTDNON;
+    if (pSearch->nFileSize >= 0 && pSearch->nFileSize != pStat->st_size) return XSTDNON;
+    if (pSearch->nMaxSize > 0 && pSearch->nMaxSize < pStat->st_size) return XSTDNON;
+    if (pSearch->nMinSize > 0 && pSearch->nMinSize > pStat->st_size) return XSTDNON;
+
+    if (pSearch->nPermissions)
+    {
+        char buff[XPERM_MAX];
+        XPath_ModeToChmod(buff, sizeof(buff), pStat->st_mode);
+        if (atoi(buff) != pSearch->nPermissions) return XSTDNON;
+    }
+
+    if (pSearch->nFileTypes)
+    {
+        if (XFILE_XCHECK_FL(pSearch->nFileTypes, XF_EXEC) &&
+            !XFile_IsExec(pStat->st_mode)) return XSTDNON;
+
+        if (pSearch->nFileTypes & ~XF_EXEC)
+        {
+            xfile_type_t eType = XFile_GetType(pStat->st_mode);
+            if (!XFILE_XCHECK_FL(pSearch->nFileTypes, eType)) return XSTDNON;
+        }
+    }
+
+    if (xstrused(pSearch->sName))
+    {
+        char sName[XPATH_MAX];
+        if (pSearch->bInsensitive) xstrncase(sName, sizeof(sName), XSTR_LOWER, pName);
+        const char *pSearchName = pSearch->bInsensitive ? (const char *)sName : pName;
+
+        xbool_t bFound = XSearch_Name(pSearch, pSearchName);
+        if (!bFound) return XSTDNON;
+    }
+
+    if (xstrused(pSearch->sText))
+    {
+        xfile_type_t eType = XFile_GetType(pStat->st_mode);
+        if (eType != XF_REGULAR) return XSTDNON;
+
+        XSTATUS nStatus = XSearch_Text(pSearch, pPath, pName, pStat);
+        if (nStatus <= XSTDNON) return nStatus;
+    }
+
+    return XSTDOK;
+}
+
+void XSearch_ClearCb(xarray_data_t *pArrData)
+{
+    if (pArrData == NULL || pArrData->pData == NULL) return;
+    if (!pArrData->nKey) xfree(pArrData->pPool, pArrData->pData);
+    else XArray_Destroy((xarray_t*)pArrData->pData);
+}
+
+void XSearch_Init(xsearch_t *pSrcCtx, const char *pFileName)
+{
+    XCHECK_VOID_NL((pSrcCtx != NULL));
+    pSrcCtx->nInterrupted = XFALSE;
+    pSrcCtx->pInterrupted = &pSrcCtx->nInterrupted;
+    pSrcCtx->bInsensitive = XFALSE;
+    pSrcCtx->bSearchLines = XFALSE;
+    pSrcCtx->bMatchOnly = XFALSE;
+    pSrcCtx->bRecursive = XFALSE;
+    pSrcCtx->bReadStdin = XFALSE;
+    pSrcCtx->callback = NULL;
+    pSrcCtx->pUserCtx = NULL;
+
+    XArray_InitPool(&pSrcCtx->nameTokens, XSTDNON, XSTDNON, XFALSE);
+    XArray_InitPool(&pSrcCtx->fileArray, XSTDNON, XSTDNON, XFALSE);
+
+    pSrcCtx->fileArray.clearCb = XSearch_ArrayClearCb;
+    pSrcCtx->nameTokens.clearCb = XSearch_ClearCb;
+
+    pSrcCtx->sName[0] = XSTR_NUL;
+    pSrcCtx->sText[0] = XSTR_NUL;
+
+    if (xstrsrc(pFileName, ";") >= 0) // Tokenize the file name for multy search
+        xstrsplita(pFileName, ";", &pSrcCtx->nameTokens, XFALSE, XFALSE);
+
+    xstrncpy(pSrcCtx->sName, sizeof(pSrcCtx->sName), pFileName);
+
+    pSrcCtx->nBufferSize = 0;
+    pSrcCtx->nPermissions = 0;
+    pSrcCtx->nFileTypes = 0;
+    pSrcCtx->nLinkCount = -1;
+    pSrcCtx->nFileSize = -1;
+    pSrcCtx->nMaxSize = 0;
+    pSrcCtx->nMinSize = 0;
+}
+
+/* A search without an interruption flag of the caller's uses its own, as XSearch_Init() sets it up */
+static void XSearch_CheckFlag(xsearch_t *pSearch)
+{
+    if (pSearch->pInterrupted == NULL)
+        pSearch->pInterrupted = &pSearch->nInterrupted;
+}
+
+void XSearch_Destroy(xsearch_t *pSrcCtx)
+{
+    XCHECK_VOID_NL(pSrcCtx);
+    XSearch_CheckFlag(pSrcCtx);
+    XSYNC_ATOMIC_SET(pSrcCtx->pInterrupted, 1);
+
+    pSrcCtx->nameTokens.clearCb = XSearch_ClearCb;
+    pSrcCtx->fileArray.clearCb = XSearch_ArrayClearCb;
+
+    XArray_Destroy(&pSrcCtx->fileArray);
+    XArray_Destroy(&pSrcCtx->nameTokens);
+}
+
+xsearch_entry_t* XSearch_GetEntry(xsearch_t *pSearch, int nIndex)
+{
+    XCHECK_NL((pSearch != NULL && nIndex >= 0), NULL);
+    if (nIndex >= XArray_Used(&pSearch->fileArray)) return NULL;
+    return (xsearch_entry_t*)XArray_GetData(&pSearch->fileArray, nIndex);
+}
+
+/* One directory level of a recursive search. The two path buffers live on the
+   heap, not in the frame: the recursion runs on whatever stack the caller's
+   thread has, and 8 KB of path per level overflowed a default thread stack a
+   few dozen directories down. The depth is bounded for the same reason. */
+static int XSearch_Directory(xsearch_t *pSearch, const char *pDirectory, size_t nDepth)
+{
+    if (nDepth >= XSEARCH_MAX_DEPTH)
+    {
+        XSearch_ErrorCallback(pSearch, "Search depth limit reached, not descending: %s", pDirectory);
+        return XSYNC_ATOMIC_GET(pSearch->pInterrupted) ? XSTDERR : XSTDOK;
+    }
+
+    char *pPaths = (char*)malloc(XPATH_MAX * 2);
+    if (pPaths == NULL)
+    {
+        XSearch_ErrorCallback(pSearch, "Failed to alloc search path: %s", pDirectory);
+        return XSTDERR;
+    }
+
+    char *sDirPath = pPaths;
+    char *sFullPath = pPaths + XPATH_MAX;
+    xdir_t dirHandle;
+
+    size_t nDirLen = strlen(pDirectory);
+    while (nDirLen && pDirectory[nDirLen--] == XSTR_SPACE_CHAR);
+    const char *pSlash = pDirectory[nDirLen] == '/' ? XSTR_EMPTY : "/";
+
+    /* A path cut to the buffer names another file, so one that does not fit is reported and skipped */
+    size_t nDirPathLen = strlen(pDirectory) + strlen(pSlash);
+    if (nDirPathLen >= XPATH_MAX)
+    {
+        XSearch_ErrorCallback(pSearch, "Path is too long: %s", pDirectory);
+        free(pPaths);
+        return XSYNC_ATOMIC_GET(pSearch->pInterrupted) ? XSTDERR : XSTDOK;
+    }
+
+    xstrncpyf(sDirPath, XPATH_MAX, "%s%s", pDirectory, pSlash);
+
+    if (XDir_Open(&dirHandle, sDirPath) < 0)
+    {
+        XSearch_ErrorCallback(pSearch, "Failed to open directory: %s", sDirPath);
+        free(pPaths);
+        return XSYNC_ATOMIC_GET(pSearch->pInterrupted) ? XSTDERR : XSTDOK;
+    }
+
+    int nStatus = XSTDOK;
+    while (XDir_Read(&dirHandle, NULL, 0) > 0 && !XSYNC_ATOMIC_GET(pSearch->pInterrupted))
+    {
+        xstat_t statbuf;
+
+        const char *pEntryName = dirHandle.pCurrEntry;
+        if (nDirPathLen + strlen(pEntryName) >= XPATH_MAX)
+        {
+            XSearch_ErrorCallback(pSearch, "Path is too long: %s%s", sDirPath, pEntryName);
+            if (!XSYNC_ATOMIC_GET(pSearch->pInterrupted)) continue;
+
+            nStatus = XSTDERR;
+            break;
+        }
+
+        xstrncpyf(sFullPath, XPATH_MAX, "%s%s", sDirPath, pEntryName);
+
+        if (xstat(sFullPath, &statbuf) < 0)
+        {
+            XSearch_ErrorCallback(pSearch, "Failed to stat file: %s", sFullPath);
+            if (!XSYNC_ATOMIC_GET(pSearch->pInterrupted)) continue;
+
+            nStatus = XSTDERR;
+            break;
+        }
+
+        int nMatch = XSearch_CheckCriteria(pSearch, sDirPath, pEntryName, &statbuf);
+        if (nMatch > 0)
+        {
+            xsearch_entry_t *pEntry = XSearch_NewEntry(pEntryName, sDirPath, &statbuf);
+            if (pEntry == NULL)
+            {
+                XSearch_ErrorCallback(pSearch, "Failed to alloc entry: %s", sFullPath);
+                nStatus = XSTDERR;
+                break;
+            }
+
+            if (XSearch_Callback(pSearch, pEntry) < 0)
+            {
+                nStatus = XSTDERR;
+                break;
+            }
+        }
+        else if (nMatch < 0)
+        {
+            nStatus = XSTDERR;
+            break;
+        }
+
+        /* Recursive search. A link is never descended into: on POSIX the
+           lstat above already reports one as a link, and on Windows stat()
+           follows it, so a junction pointing back up the tree would recurse
+           until the path stops growing and then never stop at all. */
+        xbool_t bDescend = pSearch->bRecursive && S_ISDIR(statbuf.st_mode);
+#ifdef _WIN32
+        if (bDescend && XPath_IsLink(sFullPath)) bDescend = XFALSE;
+#endif
+
+        if (bDescend && XSearch_Directory(pSearch, sFullPath, nDepth + 1) < 0)
+        {
+            nStatus = XSTDERR;
+            break;
+        }
+    }
+
+    XDir_Close(&dirHandle);
+    free(pPaths);
+    return nStatus;
+}
+
+int XSearch(xsearch_t *pSearch, const char *pDirectory)
+{
+    XCHECK_NL((pSearch != NULL), XSTDERR);
+    XSearch_CheckFlag(pSearch);
+    if (XSYNC_ATOMIC_GET(pSearch->pInterrupted) ||
+        (pDirectory == NULL && !pSearch->bReadStdin)) return XSTDERR;
+
+    if (pSearch->bInsensitive)
+    {
+        xstrcase(pSearch->sName, XSTR_LOWER);
+        xstrcase(pSearch->sText, XSTR_LOWER);
+    }
+
+    if (pSearch->bReadStdin)
+    {
+        if (!xstrused(pSearch->sText))
+        {
+            XSearch_ErrorCallback(pSearch, "No search text provided");
+            return XSTDERR;
+        }
+
+        int nStatus = XSearch_Text(pSearch, "stdin", NULL, NULL);
+        if (nStatus <= XSTDNON) return nStatus;
+
+        xsearch_entry_t *pEntry = XSearch_NewEntry("stdin", NULL, NULL);
+        if (pEntry == NULL)
+        {
+            XSearch_ErrorCallback(pSearch, "Failed to alloc stdin entry");
+            return XSTDERR;
+        }
+
+        xstrncpy(pEntry->sLine, sizeof(pEntry->sLine), "Stdin input matches");
+        if (XSearch_Callback(pSearch, pEntry) < 0) return XSTDERR;
+
+        return XSTDOK;
+    }
+
+    return XSearch_Directory(pSearch, pDirectory, 0);
+}

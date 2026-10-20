@@ -1,0 +1,288 @@
+/*!
+ *  @file libxutils/src/net/api.h
+ *
+ *  This source is part of the "libxutils" project
+ *  2019-2021  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief Implementation of high performance, event based,
+ * non-blocking client/server API for the HTTP, WebSocket
+ * and raw TCP connections. The library will use epoll(),
+ * poll() or WSAPoll() depending on the operating system.
+ */
+
+#ifndef __XUTILS_API_H__
+#define __XUTILS_API_H__
+
+#include "xstd.h"
+#include "event.h"
+#include "sock.h"
+#include "http.h"
+#include "mdtp.h"
+#include "ws.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct xapi_ xapi_t;
+
+#define XAPI_ACCEPT_PAUSED_MAX  8
+
+#define XAPI_CONTINUE   XSTDOK
+#define XAPI_DISCONNECT XSTDERR
+#define XAPI_NO_ACTION  XSTDNON
+#define XAPI_USER_CB    XSTDUSR
+#define XAPI_RELOOP     XSTDACT
+#define XAPI_DELETE     XSTDDEL
+
+typedef enum {
+    XAPI_CB_ERROR = 0,
+    XAPI_CB_STATUS,
+    XAPI_CB_HANDSHAKE_REQUEST,
+    XAPI_CB_HANDSHAKE_RESPONSE,
+    XAPI_CB_HANDSHAKE_ANSWER,
+    XAPI_CB_REGISTERED,
+    XAPI_CB_CONNECTED,
+    XAPI_CB_LISTENING,
+    XAPI_CB_INTERRUPT,
+    XAPI_CB_COMPLETE,
+    XAPI_CB_ACCEPTED,
+    XAPI_CB_TIMEOUT,
+    XAPI_CB_CLOSED,
+    XAPI_CB_WRITE,
+    XAPI_CB_READ,
+    XAPI_CB_PING,
+    XAPI_CB_PONG,
+    XAPI_CB_USER,
+    XAPI_CB_TIMER,
+    XAPI_CB_TICK
+} xapi_cb_type_t;
+
+typedef enum {
+    XAPI_UNKNOWN = (uint8_t)0,
+    XAPI_NO_STATUS = XAPI_UNKNOWN,
+    XAPI_MISSING_TOKEN,
+    XAPI_MISSING_KEY,
+    XAPI_INVALID_KEY,
+    XAPI_INVALID_ARGS,
+    XAPI_INVALID_ROLE,
+    XAPI_INVALID_TOKEN,
+    XAPI_INVALID_PATH,
+    XAPI_ERR_AUTH,
+    XAPI_ERR_ALLOC,
+    XAPI_ERR_ASSEMBLE,
+    XAPI_ERR_CRYPT,
+    XAPI_ERR_REGISTER,
+    XAPI_ERR_RESOLVE,
+    XAPI_ERR_SUPPORT,
+    XAPI_ERR_FORK,
+    XAPI_ERR_CHMOD,
+    XAPI_ERR_CHOWN,
+    XAPI_ERR_CRTDIR,
+    XAPI_STATUS_OK = 100,
+    XAPI_TIMER_DESTROY,
+    XAPI_DESTROY,
+    XAPI_HUNGED,
+    XAPI_CLOSED
+} xapi_status_t;
+
+typedef enum {
+    XAPI_NONE = 0,
+    XAPI_SELF,
+    XAPI_EVENT,
+    XAPI_HTTP,
+    XAPI_MDTP,
+    XAPI_SOCK,
+    XAPI_WS
+} xapi_type_t;
+
+typedef enum {
+    XAPI_INACTIVE = (int)0,
+    XAPI_CUSTOM = 100,
+    XAPI_SERVER,
+    XAPI_CLIENT,
+    XAPI_PEER
+} xapi_role_t;
+
+typedef struct xapi_endpoint_ {
+    xapi_type_t eType;
+    xapi_role_t eRole;
+    xsock_cert_t certs;
+    void *pSessionData;
+    const char *pAddr;
+    const char *pUri;
+    const char *pUser;
+    const char *pGroup;
+    xmode_t nMode;
+    uint32_t nEvents;
+    uint16_t nPort;
+    xbool_t bExclusive;
+    xbool_t bAsync;
+    xbool_t bForce;
+    xbool_t bUnix;
+    xbool_t bTLS;
+    XSOCKET nFD;
+} xapi_endpoint_t;
+
+typedef struct xapi_session_ {
+    char sUserAgent[XSTR_MID];
+    char sRealIP[XSOCK_ADDR_MAX];
+    char sAddr[XSOCK_ADDR_MAX];
+    char sKey[XSOCK_ADDR_MAX];
+    char sUri[XHTTP_URL_MAX];
+
+    uint16_t nPort;
+    xsock_t sock;
+    xuint_t nID;
+    int nEvents;
+
+    xbool_t bKeepAlive;
+    xbool_t bCancel;
+    xbool_t bAlloc;
+
+    /* Non-blocking SSL routine */
+    xbool_t bReadOnWrite;
+    xbool_t bWriteOnRead;
+    xbool_t bKeepRxBuffer;
+
+    /* WebSocket handshake routine */
+    xbool_t bHandshakeStart;
+    xbool_t bHandshakeDone;
+    xbool_t bWSFragStart;
+
+    /* How far an unfinished handshake request has been looked at: the bytes known to hold no end of header, and
+       the size the buffer must reach before a complete header still waiting for its body can parse differently. */
+    size_t nHeaderScan;
+    size_t nHeaderWait;
+
+    /* How far the chunks of a complete header waiting for its chunked body have been scanned: nHeaderScan is
+       then where the body starts, and nHeaderWait is SIZE_MAX, since the length is known only at the end. */
+    xhttp_chunked_t headerChunks;
+
+    xbyte_buffer_t rxBuffer;
+    xbyte_buffer_t txBuffer;
+    xbyte_buffer_t wsBuffer;
+    xevent_data_t *pEvData;
+    xevent_data_t *pTimer;
+
+    xws_frame_type_t eWSFragType;
+    xapi_type_t eType;
+    xapi_role_t eRole;
+    xapi_t *pApi;
+
+    void *pSessionData;
+    void *pPacket;
+} xapi_session_t;
+
+typedef struct xapi_ctx_ {
+    xapi_cb_type_t eCbType;
+    xapi_type_t eStatType;
+    uint8_t nStatus;
+    int nWorkerIndex;
+    int nCoreIndex;
+    int nSysError;
+    xapi_t *pApi;
+} xapi_ctx_t;
+
+typedef int(*xapi_cb_t)(xapi_ctx_t *pCtx, xapi_session_t *pData);
+
+struct xapi_ {
+    xapi_cb_t callback;
+    xevents_t events;
+    size_t nRxSize;
+    void *pUserCtx;
+
+    xpid_t *pWorkerPIDs;
+    xpid_t nWorkerPID;
+
+    xuint_t nSessionCounter;
+    size_t nWorkerCount;
+    int nWorkerIndex;
+    int nCoreIndex;
+
+    xbool_t bAllowMissingKey;
+    xbool_t bHaveEvents;
+    xbool_t bUseHashMap;
+    xbool_t bSetAffinity;
+    xbool_t bIsWorker;
+
+    uint8_t *pReadBuffer;
+
+    /* Listeners left unpolled for a moment after accept() ran out of descriptors or memory. XAPI_Service()
+       polls them again once nAcceptResumeMs has passed: a timer would need a descriptor of its own. */
+    xapi_session_t *pAcceptPaused[XAPI_ACCEPT_PAUSED_MAX];
+    size_t nAcceptPaused;
+    uint64_t nAcceptResumeMs;
+};
+
+const char* XAPI_GetStatus(xapi_ctx_t *pCtx);
+const char* XAPI_GetStatusStr(xapi_status_t eStatus);
+const char* XAPI_GetTypeStr(xapi_type_t eType);
+
+/*!
+ * @brief The status of the callback with the system error behind it.
+ *
+ * Writes "Can not connect to the socket (Connection refused)", or the status
+ * alone when no system call failed (protocol errors, invalid arguments, name
+ * resolution, TLS protocol errors). The error is pCtx->nSysError: saved when
+ * the system call failed, so unlike errno it belongs to this status.
+ *
+ * @return Length of the text written to pDst.
+ */
+size_t XAPI_DescribeStatus(const xapi_ctx_t *pCtx, char *pDst, size_t nSize);
+
+xbool_t XAPI_IsDestroyEvent(xapi_ctx_t *pCtx);
+xbool_t XAPI_IsSupportedRole(xapi_role_t eRole);
+
+xbyte_buffer_t* XAPI_GetTxBuff(xapi_session_t *pSession);
+xbyte_buffer_t* XAPI_GetRxBuff(xapi_session_t *pSession);
+XSTATUS XAPI_PutTxBuff(xapi_session_t *pSession, xbyte_buffer_t *pBuffer);
+
+XSTATUS XAPI_Init(xapi_t *pApi, xapi_cb_t callback, void *pUserCtx);
+XSTATUS XAPI_SetRxSize(xapi_t *pApi, size_t nSize);
+XSTATUS XAPI_SetWorkerAffinity(xapi_t *pApi, xbool_t bEnable);
+void XAPI_Destroy(xapi_t *pApi);
+
+xpid_t XAPI_WaitWorker(xapi_t *pApi, int *pWaitStatus);
+XSTATUS XAPI_InitWorkers(xapi_t *pApi, size_t nWorkers, xbool_t bSetAffinity);
+XSTATUS XAPI_WatchWorkers(xapi_t *pApi, const volatile sig_atomic_t *pInterrupted);
+XSTATUS XAPI_StopWorkers(xapi_t *pApi, int nSignal);
+XSTATUS XAPI_WaitWorkers(xapi_t *pApi);
+
+xbool_t XAPI_IsWorker(const xapi_t *pApi);
+int XAPI_GetWorkerIndex(const xapi_t *pApi);
+int XAPI_GetCoreIndex(const xapi_t *pApi);
+size_t XAPI_GetWorkerCount(const xapi_t *pApi);
+xpid_t XAPI_GetWorkerPID(const xapi_t *pApi);
+const xpid_t* XAPI_GetWorkerPIDs(const xapi_t *pApi);
+
+XSTATUS XAPI_Disconnect(xapi_session_t *pData);
+XSTATUS XAPI_DeleteTimer(xapi_session_t *pData);
+XSTATUS XAPI_AddTimer(xapi_session_t *pData, int nTimeoutMs);
+XSTATUS XAPI_ExtendTimer(xapi_session_t *pData, int nTimeoutMs);
+
+XSTATUS XAPI_DisableEvent(xapi_session_t *pData, int nEvent);
+XSTATUS XAPI_EnableEvent(xapi_session_t *pData, int nEvent);
+XSTATUS XAPI_SetEvents(xapi_session_t *pData, int nEvents);
+size_t XAPI_GetEventCount(xapi_t *pApi);
+
+/* Dispatch already buffered input after selecting/changing its protocol. No socket read.
+   Returns XAPI_CONTINUE, XAPI_RELOOP or XAPI_DISCONNECT; the caller owns disconnection. */
+XSTATUS XAPI_ProcessBuffered(xapi_session_t *pSession);
+XSTATUS XAPI_RespondHTTP(xapi_session_t *pSession, int nCode, xapi_status_t eStatus);
+XSTATUS XAPI_AuthorizeHTTP(xapi_session_t *pSession, const char *pToken, const char *pKey);
+
+void XAPI_InitEndpoint(xapi_endpoint_t *pEndpt);
+XSTATUS XAPI_AddEndpoint(xapi_t *pApi, xapi_endpoint_t *pEndpt);
+XSTATUS XAPI_AddEvent(xapi_t *pApi, xapi_endpoint_t *pEndpt);
+XSTATUS XAPI_AddPeer(xapi_t *pApi, xapi_endpoint_t *pEndpt);
+XSTATUS XAPI_Connect(xapi_t *pApi, xapi_endpoint_t *pEndpt);
+XSTATUS XAPI_Listen(xapi_t *pApi, xapi_endpoint_t *pEndpt);
+
+xevent_status_t XAPI_Service(xapi_t *pApi, int nTimeoutMs);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __XUTILS_API_H__ */

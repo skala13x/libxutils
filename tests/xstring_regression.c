@@ -1,0 +1,556 @@
+/* libxutils: the growable XString object.
+ *
+ * The plain C helpers are covered elsewhere; this is the object API that
+ * config parsing and log rendering build on. Every case asserts on both the
+ * contents and the recorded length, since a length that drifts from the
+ * bytes is what turns a later append into a silent truncation.
+ */
+
+#include "test.h"
+#include "str.h"
+#include "array.h"
+
+static int XTest_build(void)
+{
+    /* A string grows on demand and keeps its length in step with its bytes. */
+    xstring_t str;
+    CHECK(XString_Init(&str, 0, 0) >= 0, "A zero capacity string initializes");
+    CHECK(str.nLength == 0 && str.pData == NULL, "A zero capacity string owns nothing yet");
+
+    CHECK(XString_Add(&str, "hello", 5) == 5, "The first append reports the new length");
+    CHECK(str.nLength == 5 && strcmp(str.pData, "hello") == 0, "The bytes and the length agree");
+    CHECK(str.nSize > str.nLength, "The capacity leaves room for a terminator");
+
+    CHECK(XString_Append(&str, "-%d-%s", 42, "x") == 10, "A formatted append reports the new length");
+    CHECK(strcmp(str.pData, "hello-42-x") == 0, "The formatted append lands at the end");
+    CHECK(str.nLength == strlen(str.pData), "The length still matches the bytes");
+
+    /* Appending binary content keeps the embedded NUL. */
+    const char binary[] = {'a', 0x00, 'b'};
+    CHECK(XString_Add(&str, binary, sizeof(binary)) == 13, "A binary append reports the new length");
+    CHECK(str.nLength == 13, "The embedded NUL is counted, not treated as the end");
+    CHECK(str.pData[11] == 0x00 && str.pData[12] == 'b', "The bytes after the embedded NUL are kept");
+
+    XString_Clear(&str);
+    CHECK(str.nLength == 0 && str.pData == NULL, "Clearing releases the storage");
+
+    /* Repeated growth across many appends. */
+    CHECK(XString_Init(&str, 4, 0) >= 0, "A small string initializes");
+    for (int i = 0; i < 500; i++)
+        CHECK(XString_Add(&str, "x", 1) == i + 1, "Every append reports the running length");
+    CHECK(str.nLength == 500, "Every appended byte is counted");
+    for (size_t i = 0; i < str.nLength; i++)
+        CHECK(str.pData[i] == 'x', "Growth preserved every byte");
+    CHECK(str.pData[str.nLength] == '\0', "The grown string is still terminated");
+
+    /* Resizing down to the length keeps the contents. */
+    CHECK(XString_Resize(&str, str.nLength + 1) >= 0, "The string resizes down");
+    CHECK(str.nLength == 500, "Resizing down kept the length");
+
+    /* Increasing adds capacity without changing the contents. */
+    size_t nBefore = str.nLength;
+    CHECK(XString_Increase(&str, 1024) >= 0, "The string increases its capacity");
+    CHECK(str.nLength == nBefore, "Increasing does not change the length");
+    CHECK(str.nSize >= nBefore + 1024, "The capacity grew by what was asked");
+
+    XString_Clear(&str);
+    XString_Clear(&str);
+    return 0;
+}
+
+static int XTest_edit(void)
+{
+    /* Inserting shifts the tail; removing closes the gap. */
+    xstring_t str;
+    CHECK(XString_InitFrom(&str, "%s", "hello-42-x") > 0, "The string is built");
+
+    CHECK(XString_Insert(&str, 5, "INS", 3) == 13, "An insert reports the new length");
+    CHECK(strcmp(str.pData, "helloINS-42-x") == 0, "The insert shifts the tail out of the way");
+
+    CHECK(XString_Remove(&str, 5, 3) == 10, "A removal reports the new length");
+    CHECK(strcmp(str.pData, "hello-42-x") == 0, "The removal closed the gap");
+
+    CHECK(XString_InsertFmt(&str, 0, "[%d]", 7) == 13, "A formatted insert reports the new length");
+    CHECK(strcmp(str.pData, "[7]hello-42-x") == 0, "The formatted insert lands at its position");
+
+    CHECK(XString_Delete(&str, 0, 3) == 10, "A delete reports the new length");
+    CHECK(strcmp(str.pData, "hello-42-x") == 0, "The delete removed the leading bytes");
+
+    CHECK(XString_Advance(&str, 2) == 8, "Advancing reports the new length");
+    CHECK(strcmp(str.pData, "llo-42-x") == 0, "Advancing dropped the leading bytes");
+
+    /* Inserting at the very end is an append. */
+    size_t nLength = str.nLength;
+    CHECK(XString_Insert(&str, nLength, "END", 3) > 0, "An insert at the end succeeds");
+    CHECK(strcmp(str.pData, "llo-42-xEND") == 0, "The insert at the end appended");
+
+    /* Out of range edits take nothing rather than guessing at a position.
+     * Removing reports that it took no bytes; deleting reports the length
+     * it left behind. */
+    CHECK(XString_Remove(&str, 999, 1) == 0, "A removal past the end takes nothing");
+    CHECK(XString_Delete(&str, 999, 1) == (int)str.nLength, "A delete past the end leaves the length alone");
+    CHECK(strcmp(str.pData, "llo-42-xEND") == 0, "A refused edit changed nothing");
+
+    /* A removal longer than the remainder is clamped to it. */
+    CHECK(XString_Remove(&str, 8, 999) == 8, "An oversized removal is clamped to the remainder");
+    CHECK(strcmp(str.pData, "llo-42-x") == 0, "The clamped removal took only what was there");
+
+    /* Advancing past the end empties the string. */
+    CHECK(XString_Advance(&str, 999) >= 0, "Advancing past the end is accepted");
+    CHECK(str.nLength == 0, "Advancing past the end empties the string");
+
+    XString_Clear(&str);
+    return 0;
+}
+
+static int XTest_transform(void)
+{
+    /* Case changes apply to a range or to the whole string. */
+    xstring_t str;
+    CHECK(XString_InitFrom(&str, "%s", "MiXeD case 123") > 0, "The string is built");
+
+    CHECK(XString_Case(&str, XSTR_UPPER, 0, 5) > 0, "A ranged case change succeeds");
+    CHECK(strncmp(str.pData, "MIXED", 5) == 0, "The range was uppercased");
+    CHECK(strcmp(&str.pData[5], " case 123") == 0, "The bytes outside the range were left alone");
+
+    CHECK(XString_ChangeCase(&str, XSTR_LOWER) > 0, "A whole string case change succeeds");
+    CHECK(strcmp(str.pData, "mixed case 123") == 0, "The whole string was lowercased");
+
+    CHECK(XString_ChangeCase(&str, XSTR_UPPER) > 0, "The string uppercases");
+    CHECK(strcmp(str.pData, "MIXED CASE 123") == 0, "Digits and spaces are left alone");
+
+    /* Replacement rebuilds the string in place. */
+    CHECK(XString_Replace(&str, "CASE", "text") > 0, "A replacement succeeds");
+    CHECK(strcmp(str.pData, "MIXED text 123") == 0, "The replacement landed");
+    CHECK(str.nLength == strlen(str.pData), "The length follows the replacement");
+
+    /* A replacement that shortens and one that lengthens. */
+    CHECK(XString_Replace(&str, "MIXED", "M") > 0, "A shortening replacement succeeds");
+    CHECK(strcmp(str.pData, "M text 123") == 0, "The shortening replacement landed");
+
+    CHECK(XString_Replace(&str, "M", "MMMMM") > 0, "A lengthening replacement succeeds");
+    CHECK(strcmp(str.pData, "MMMMM text 123") == 0, "The lengthening replacement landed");
+
+    /* A needle that is not there leaves the string alone. */
+    size_t nBefore = str.nLength;
+    XString_Replace(&str, "absent", "x");
+    CHECK(str.nLength == nBefore, "An absent needle changed nothing");
+
+    /* Searching reports a position relative to where the scan started,
+     * not an absolute offset into the string. */
+    CHECK(XString_Search(&str, 0, "text") == 6, "A hit from the start reports its absolute position");
+    CHECK(XString_Search(&str, 0, "MMMMM") == 0, "A hit at the start reports zero");
+    CHECK(XString_Search(&str, 5, "text") == 1, "A hit reports its offset from the scan position");
+    CHECK(XString_Search(&str, 0, "absent") < 0, "A miss is reported as negative");
+    CHECK(XString_Search(&str, 999, "text") < 0, "A search past the end finds nothing");
+
+    XString_Clear(&str);
+    return 0;
+}
+
+static int XTest_substrings(void)
+{
+    /* Substrings can be taken into a caller buffer, into another string,
+     * or into a newly allocated one. */
+    xstring_t str;
+    CHECK(XString_InitFrom(&str, "%s", "abcdefghij") > 0, "The string is built");
+
+    char sBuffer[32];
+    CHECK(XString_Sub(&str, sBuffer, sizeof(sBuffer), 2, 3) == 3, "A substring reports its length");
+    CHECK(strcmp(sBuffer, "cde") == 0, "The substring is the requested slice");
+
+    xstring_t sub;
+    CHECK(XString_SubStr(&str, &sub, 2, 3) == 3, "A substring object reports its length");
+    CHECK(strcmp(sub.pData, "cde") == 0, "The substring object holds the slice");
+    XString_Clear(&sub);
+
+    xstring_t *pNew = XString_SubNew(&str, 2, 3);
+    CHECK(pNew != NULL && strcmp(pNew->pData, "cde") == 0, "A new substring holds the slice");
+    XString_Clear(pNew);
+
+    /* The source is untouched by any of them. */
+    CHECK(strcmp(str.pData, "abcdefghij") == 0, "The source survives every substring");
+
+    /* A position past the end yields nothing and leaves the source alone. */
+    CHECK(XString_Sub(&str, sBuffer, sizeof(sBuffer), 99, 3) < 0, "A substring past the end is refused");
+    CHECK(XString_SubStr(&str, &sub, 99, 3) < 0, "A substring object past the end is refused");
+    CHECK(XString_SubNew(&str, 99, 3) == NULL, "A new substring past the end is refused");
+    CHECK(strcmp(str.pData, "abcdefghij") == 0, "A refused substring leaves the source intact");
+    CHECK(str.nLength == 10, "A refused substring leaves the source length intact");
+
+    /* Cutting between markers. */
+    xstring_t marked;
+    CHECK(XString_InitFrom(&marked, "%s", "pre[mid]post") > 0, "The marked string is built");
+
+    CHECK(XString_Cut(&marked, sBuffer, sizeof(sBuffer), "[", "]") == 3, "A cut reports its length");
+    CHECK(strcmp(sBuffer, "mid") == 0, "The cut is the text between the markers");
+
+    xstring_t cut;
+    CHECK(XString_CutSub(&marked, &cut, "[", "]") == 3, "A cut object reports its length");
+    CHECK(strcmp(cut.pData, "mid") == 0, "The cut object holds the text");
+    XString_Clear(&cut);
+
+    xstring_t *pCutNew = XString_CutNew(&marked, "[", "]");
+    CHECK(pCutNew != NULL && strcmp(pCutNew->pData, "mid") == 0, "A new cut holds the text");
+    XString_Clear(pCutNew);
+
+    /* Markers that are not there yield nothing. */
+    CHECK(XString_Cut(&marked, sBuffer, sizeof(sBuffer), "{", "}") <= 0, "Absent markers cut nothing");
+    CHECK(XString_CutNew(&marked, "{", "}") == NULL, "Absent markers make no new string");
+
+    XString_Clear(&marked);
+    XString_Clear(&str);
+    return 0;
+}
+
+static int XTest_tokens(void)
+{
+    /* Tokenizing walks the string by returning the next scan position. */
+    xstring_t str;
+    CHECK(XString_InitFrom(&str, "%s", "alpha:beta:gamma") > 0, "The string is built");
+
+    const char *pExpected[] = {"alpha", "beta", "gamma"};
+    char sToken[32];
+    int nPosit = 0;
+
+    for (int i = 0; i < 3; i++)
+    {
+        int nNext = XString_Tokenize(&str, sToken, sizeof(sToken), (size_t)nPosit, ":");
+        CHECK(nNext >= 0, "Every token is found");
+        CHECK(strcmp(sToken, pExpected[i]) == 0, "Every token is the expected one");
+        if (i < 2) CHECK(nNext > nPosit, "The scan position advances past each delimiter");
+        else CHECK(nNext == 0, "The last token reports no delimiter after it");
+        nPosit = nNext;
+    }
+
+    /* The object form fills an initialized destination. */
+    xstring_t token;
+    CHECK(XString_Init(&token, 0, 0) >= 0, "The token destination initializes");
+    CHECK(XString_Token(&str, &token, 0, ":") > 0, "The first token is taken");
+    CHECK(strcmp(token.pData, "alpha") == 0, "The token object holds the first field");
+    XString_Clear(&token);
+
+    /* Splitting yields every field at once. Unlike xstrsplit(), which
+     * stores plain C strings, this stores string objects. */
+    xarray_t *pFields = XString_SplitStr(&str, ":");
+    CHECK(pFields != NULL && XArray_Used(pFields) == 3, "Splitting yields one entry per field");
+
+    for (size_t i = 0; i < 3; i++)
+    {
+        xstring_t *pField = (xstring_t*)XArray_GetData(pFields, i);
+        CHECK(pField != NULL && pField->pData != NULL, "Every split entry is a string object");
+        CHECK(strcmp(pField->pData, pExpected[i]) == 0, "Every split field is correct");
+        CHECK(pField->nLength == strlen(pExpected[i]), "Every split field has its own length");
+    }
+    XArray_Destroy(pFields);
+
+    /* The C string form of the split agrees, and stores objects too. */
+    pFields = XString_Split("alpha:beta:gamma", ":");
+    CHECK(pFields != NULL && XArray_Used(pFields) == 3, "The C string split yields the same fields");
+    for (size_t i = 0; i < 3; i++)
+    {
+        xstring_t *pField = (xstring_t*)XArray_GetData(pFields, i);
+        CHECK(pField != NULL && strcmp(pField->pData, pExpected[i]) == 0,
+            "The C string split yields the same field values");
+    }
+    XArray_Destroy(pFields);
+
+    /* A string with no delimiter in it is a single field. */
+    xstring_t single;
+    CHECK(XString_InitFrom(&single, "%s", "nodelimiter") > 0, "A single field string is built");
+    pFields = XString_SplitStr(&single, ":");
+    CHECK(pFields != NULL && XArray_Used(pFields) == 1, "A string without the delimiter is one field");
+    XArray_Destroy(pFields);
+    XString_Clear(&single);
+
+    /* A delimiter that is not there yields the whole string. */
+    int nNext = XString_Tokenize(&str, sToken, sizeof(sToken), 0, "|");
+    CHECK(nNext == 0, "A missing delimiter reports no next position");
+    CHECK(strcmp(sToken, "alpha:beta:gamma") == 0, "A missing delimiter yields the whole string");
+
+    /* A position past the end has nothing to tokenize. */
+    CHECK(XString_Tokenize(&str, sToken, sizeof(sToken), 999, ":") < 0, "A position past the end is refused");
+
+    XString_Clear(&str);
+    return 0;
+}
+
+static int XTest_construction(void)
+{
+    /* Each constructor produces an independently owned string. */
+    xstring_t *pNew = XString_New(64, 0);
+    CHECK(pNew != NULL, "A sized string is allocated");
+    CHECK(pNew->nSize >= 64, "The sized string has its capacity");
+    CHECK(pNew->nLength == 0, "The sized string starts empty");
+    CHECK(XString_Add(pNew, "in-new", 6) == 6, "The sized string accepts data");
+    XString_Clear(pNew);
+
+    xstring_t *pFrom = XString_From("from-data", 9);
+    CHECK(pFrom != NULL && strcmp(pFrom->pData, "from-data") == 0, "A string is built from bytes");
+    CHECK(pFrom->nLength == 9, "The built string has the right length");
+
+    xstring_t *pFmt = XString_FromFmt("fmt-%d", 9);
+    CHECK(pFmt != NULL && strcmp(pFmt->pData, "fmt-9") == 0, "A string is built from a format");
+
+    xstring_t *pCopy = XString_FromStr(pFrom);
+    CHECK(pCopy != NULL && strcmp(pCopy->pData, "from-data") == 0, "A string is copied from another");
+    CHECK(pCopy->pData != pFrom->pData, "The copy owns its own storage");
+
+    /* Clearing the source leaves the copy intact. */
+    XString_Clear(pFrom);
+    CHECK(strcmp(pCopy->pData, "from-data") == 0, "The copy outlives its source");
+    XString_Clear(pCopy);
+    XString_Clear(pFmt);
+
+    /* Copying initializes its destination rather than appending to one, so
+     * it takes a bare xstring_t and must not read what was in it. A
+     * destination that already owns a buffer is its owner's to clear. */
+    xstring_t target, source;
+    CHECK(XString_InitFrom(&source, "%s", "new-contents") > 0, "The source is built");
+
+    CHECK(XString_Copy(&target, &source) > 0, "The copy succeeds into an uninitialized destination");
+    CHECK(strcmp(target.pData, "new-contents") == 0, "The target holds the source contents");
+    CHECK(target.pData != source.pData, "The target owns its own storage");
+    CHECK(target.nLength == source.nLength, "The target has the source length");
+
+    /* Appending one string onto another. */
+    CHECK(XString_AddString(&target, &source) > 0, "One string appends onto another");
+    CHECK(strcmp(target.pData, "new-contentsnew-contents") == 0, "The append lands at the end");
+
+    /* Appending a string to itself must survive the reallocation. */
+    CHECK(XString_AddString(&target, &target) > 0, "A string appends onto itself");
+    CHECK(target.nLength == 48, "The self append doubled the length");
+
+    XString_Clear(&source);
+    XString_Clear(&target);
+
+    /* Setting points the string at a caller buffer without taking it over:
+     * the capacity stays zero, so clearing releases nothing and the caller
+     * keeps responsibility for the memory. */
+    char *pBorrowed = strdup("adopted");
+    CHECK(pBorrowed != NULL, "A caller allocation is made");
+
+    xstring_t borrowed;
+    CHECK(XString_Init(&borrowed, 0, 0) >= 0, "The borrowing string initializes");
+    CHECK(XString_Set(&borrowed, pBorrowed, 7) == 7, "The buffer is pointed at");
+    CHECK(borrowed.pData == pBorrowed, "The string points at the caller buffer, not a copy");
+    CHECK(borrowed.nSize == 0, "A borrowed buffer is not owned capacity");
+    CHECK(strcmp(borrowed.pData, "adopted") == 0, "The borrowed bytes are readable");
+
+    XString_Clear(&borrowed);
+    CHECK(strcmp(pBorrowed, "adopted") == 0, "Clearing a borrowing string leaves the buffer alone");
+    free(pBorrowed);
+    return 0;
+}
+
+static int XTest_colors(void)
+{
+    /* Colouring wraps a range in escape sequences, which lengthens the
+     * stored bytes while leaving the visible text alone. */
+    xstring_t str;
+    CHECK(XString_InitFrom(&str, "%s", "colorize") > 0, "The string is built");
+    size_t nPlain = str.nLength;
+
+    CHECK(XString_Color(&str, XSTR_CLR_RED, 0, 5) > 0, "A range is coloured");
+    CHECK(str.nLength > nPlain, "Colouring lengthens the stored bytes");
+    CHECK(strstr(str.pData, "color") != NULL, "The coloured text is still there");
+    CHECK(str.pData[0] == '\x1B', "The colour starts with an escape");
+    CHECK(strstr(str.pData, XSTR_FMT_RESET) != NULL, "The colour is reset afterwards");
+
+    /* The visible character count is unchanged. */
+    size_t nChars = 0;
+    xstrextra(str.pData, str.nLength, 0, &nChars, NULL);
+    CHECK(nChars == nPlain, "Colouring adds no visible characters");
+
+    XString_Clear(&str);
+
+    /* Colouring the whole string. */
+    CHECK(XString_InitFrom(&str, "%s", "whole") > 0, "The string is rebuilt");
+    nPlain = str.nLength;
+
+    CHECK(XString_ChangeColor(&str, XSTR_CLR_GREEN) > 0, "The whole string is coloured");
+    CHECK(str.nLength > nPlain, "Colouring the whole string lengthens it");
+
+    nChars = 0;
+    xstrextra(str.pData, str.nLength, 0, &nChars, NULL);
+    CHECK(nChars == nPlain, "Colouring the whole string adds no visible characters");
+    CHECK(strstr(str.pData, "whole") != NULL, "The text survives being coloured");
+
+    XString_Clear(&str);
+    return 0;
+}
+
+static int XTest_borrowed_copy(void)
+{
+    /* A string set over borrowed data has a length but no size of its own.
+       Copying it sized the copy by that size, got no buffer at all, and wrote
+       the terminator through a NULL pointer. */
+    char sBorrowed[] = "borrowed text";
+    xstring_t source, copy;
+    XString_Init(&source, 0, XFALSE);
+    XString_Set(&source, sBorrowed, strlen(sBorrowed));
+
+    CHECK(XString_Copy(&copy, &source) == (int)strlen(sBorrowed), "A borrowed string can be copied");
+    CHECK(copy.pData != sBorrowed && strcmp(copy.pData, sBorrowed) == 0, "The copy owns identical text");
+    XString_Clear(&copy);
+
+    /* A shrink keeps the terminator inside the buffer */
+    xstring_t shrunk;
+    CHECK(XString_Init(&shrunk, 32, XFALSE) >= 0 && XString_Add(&shrunk, "0123456789", 10) == 10, "Build a string to shrink");
+    CHECK(XString_Resize(&shrunk, 4) == 4, "Shrink the buffer below the text");
+    CHECK(shrunk.nLength == 3 && strcmp(shrunk.pData, "012") == 0, "The shrunk text keeps its terminator in bounds");
+    XString_Clear(&shrunk);
+
+    CHECK(XString_Split(NULL, ",") == NULL, "Splitting a missing string yields nothing");
+    return 0;
+}
+
+static int XTest_borrowed_resize(void)
+{
+    char raw[] = {'a', 'b', 'c'};
+    char longer[] = "abc ignored";
+    char *sources[] = {raw, longer};
+    const size_t sizes[] = {1, 2, 3, 4, 32};
+    for (size_t i = 0; i < sizeof(sources) / sizeof(*sources); i++)
+    {
+        for (size_t j = 0; j < sizeof(sizes) / sizeof(*sizes); j++)
+        {
+            xstring_t string;
+            XString_Init(&string, 0, XFALSE);
+            XString_Set(&string, sources[i], 3);
+            CHECK(XString_Resize(&string, sizes[j]) == (int)sizes[j], "Borrowed bytes can become owned storage");
+            size_t nExpected = XSTD_MIN(3, sizes[j] - 1);
+            int nCorrect = string.nLength == nExpected && string.pData != sources[i] &&
+                !memcmp(string.pData, raw, nExpected) && string.pData[nExpected] == 0;
+            XString_Clear(&string);
+            CHECK(nCorrect, "A borrowed string copies only its explicit length and terminates in bounds");
+        }
+    }
+    CHECK(!memcmp(raw, "abc", 3) && !strcmp(longer, "abc ignored"), "Resizing leaves caller-owned bytes untouched");
+    return 0;
+}
+
+static int XTest_guards(void)
+{
+    xstring_t str, other;
+    char sDst[16];
+
+    CHECK(XString_Add(NULL, "a", 1) == XSTDERR && XString_Insert(NULL, 0, "a", 1) == XSTDERR,
+        "Adding and inserting need a string");
+    CHECK(XString_Init(&str, 8, 0) >= 0 && XString_Add(&str, "abcd", 4) == 4, "Build a string");
+    CHECK(XString_Add(&str, NULL, 1) == XSTDERR && XString_Insert(&str, 0, NULL, 1) == XSTDERR,
+        "Data that is not there can not be added");
+    CHECK(XString_Add(&str, "x", INT_MAX) == XSTDERR && XString_Insert(&str, 0, "x", INT_MAX) == XSTDERR,
+        "Nor can more than an int counts");
+    CHECK(XString_Add(&str, str.pData + 2, 3) == XSTDERR && XString_Insert(&str, 0, str.pData + 2, 3) == XSTDERR,
+        "Nor more of the string's own bytes than it holds");
+    CHECK(XString_Insert(&str, 1, "x", 0) == 4 && !strcmp(str.pData, "abcd"), "Inserting nothing changes nothing");
+    CHECK(XString_Remove(&str, 1, 0) == 0 && str.nLength == 4, "Removing nothing changes nothing");
+
+    CHECK(XString_Case(&str, (xstr_case_t)99, 0, 4) == 4 && !strcmp(str.pData, "abcd"), "An unknown case does nothing");
+    CHECK(XString_Search(NULL, 0, "a") == XSTDERR && XString_Search(&str, 4, "a") == XSTDERR,
+        "A search needs a string and a start inside it");
+
+    CHECK(XString_Tokenize(NULL, sDst, sizeof(sDst), 0, ",") == XSTDERR, "Tokenizing needs a string");
+    CHECK(XString_Tokenize(&str, NULL, 0, 0, "c") == 3, "A token need not be copied");
+    CHECK(XString_Token(NULL, &other, 0, ",") == XSTDERR && XString_Token(&str, NULL, 0, ",") == XSTDERR,
+        "A token needs a string and a target");
+
+    CHECK(XString_Replace(NULL, "a", "b") == XSTDERR && XString_Replace(&str, "", "b") == XSTDERR &&
+        XString_Replace(&str, "a", NULL) == XSTDERR, "Replacing needs a string, a match and a replacement");
+    CHECK(XString_Sub(NULL, sDst, sizeof(sDst), 0, 1) == XSTDERR && XString_Sub(&str, sDst, sizeof(sDst), 4, 1) == XSTDERR,
+        "A substring needs a string and a start inside it");
+    CHECK(XString_SubStr(NULL, &other, 0, 1) == XSTDERR && XString_SubStr(&str, &other, 4, 1) == XSTDERR,
+        "So does an owned substring");
+    CHECK(XString_SubStr(&str, &other, 1, 0) == XSTDERR && other.pData == NULL, "An empty substring is refused");
+
+    CHECK(XString_Color(&str, XSTR_CLR_RED, 4, 1) == XSTDERR && XString_Color(&str, XSTR_CLR_RED, 2, 3) == XSTDERR,
+        "Coloring needs a range inside the string");
+
+    CHECK(XString_Cut(NULL, sDst, sizeof(sDst), "a", "c") == XSTDERR, "Cutting needs a string");
+    CHECK(XString_Cut(&str, sDst, sizeof(sDst), "x", "c") == XSTDERR, "And the start of the cut in it");
+    CHECK(XString_Cut(&str, sDst, sizeof(sDst), "abcd", NULL) == XSTDERR, "And something after the start");
+    CHECK(XString_Cut(&str, sDst, sizeof(sDst), "a", NULL) == 3 && !strcmp(sDst, "bcd"), "A cut can run to the end");
+    CHECK(XString_Cut(&str, sDst, sizeof(sDst), "a", "x") == XSTDERR, "An end that is not there is no cut");
+    CHECK(XString_CutSub(NULL, &other, "a", "c") == XSTDERR, "An owned cut needs a string");
+
+    CHECK(XString_From(NULL, 1) == NULL && XString_From("a", 0) == NULL, "A string is made from something");
+    CHECK(XString_FromFmt("%s", "") == NULL, "An empty format makes no string");
+    CHECK(XString_FromStr(NULL) == NULL, "Nor does no string");
+    CHECK(XString_SplitStr(NULL, ",") == NULL, "Nothing is split");
+
+    CHECK(XString_Copy(NULL, &str) == XSTDERR && XString_Copy(&other, NULL) == XSTDERR, "A copy needs both strings");
+
+    xstring_t empty;
+    CHECK(XString_Init(&empty, 0, 0) >= 0, "Make an empty string");
+    CHECK(XString_AddString(&str, &empty) == XSTDERR, "An empty string adds nothing");
+    CHECK(XString_Copy(&other, &empty) == XSTDERR, "Nor is it copied");
+    CHECK(XString_ChangeCase(&empty, XSTR_UPPER) == XSTDERR && XString_ChangeColor(&empty, XSTR_CLR_RED) == XSTDERR,
+        "An empty string has nothing to case or color");
+    CHECK(XString_Color(&empty, XSTR_CLR_RED, 0, 1) == XSTDERR, "Nor any range");
+    CHECK(XString_Tokenize(&empty, sDst, sizeof(sDst), 0, ",") == XSTDERR, "Nor any token");
+    CHECK(XString_Token(&empty, &other, 0, ",") == XSTDERR && XString_Replace(&empty, "a", "b") == XSTDERR,
+        "Nor anything to replace");
+    CHECK(XString_Cut(&empty, sDst, sizeof(sDst), "a", NULL) == XSTDERR &&
+        XString_CutSub(&empty, &other, "a", NULL) == XSTDERR, "Nor anything to cut");
+    CHECK(XString_FromStr(&empty) == NULL && XString_SplitStr(&empty, ",") == NULL, "And makes nothing");
+    XString_Clear(&empty);
+
+    XString_Clear(&str);
+    return 0;
+}
+
+/* Exported, though not declared in the header */
+int XString_Status(xstring_t *pString);
+
+static int XTest_null_args(void)
+{
+    /* Every function refuses a missing string, and a missing argument next to a real one */
+    const char *pNoFormat = NULL;
+    xstring_t str, sub;
+
+    CHECK(XString_Status(NULL) == XSTDERR && XString_Init(NULL, 8, 0) == XSTDERR, "No string has no status");
+    CHECK(XString_Resize(NULL, 8) == XSTDERR && XString_Increase(NULL, 8) == XSTDERR, "Nor grows");
+    CHECK(XString_Set(NULL, (char*)"a", 1) == XSTDERR && XString_InitFrom(NULL, "%d", 1) == XSTDERR, "Nor is set");
+    CHECK(XString_Append(NULL, "%d", 1) == XSTDERR && XString_InsertFmt(NULL, 0, "%d", 1) == XSTDERR, "Nor formatted to");
+    CHECK(XString_AddString(NULL, NULL) == XSTDERR && XString_Remove(NULL, 0, 1) == XSTDERR, "Nor added to");
+    CHECK(XString_Delete(NULL, 0, 1) == XSTDERR && XString_Advance(NULL, 1) == XSTDERR, "Nor cut");
+    CHECK(XString_Case(NULL, XSTR_UPPER, 0, 1) == XSTDERR && XString_ChangeCase(NULL, XSTR_UPPER) == XSTDERR, "Nor cased");
+    CHECK(XString_Color(NULL, XSTR_CLR_RED, 0, 1) == XSTDERR && XString_ChangeColor(NULL, XSTR_CLR_RED) == XSTDERR,
+        "Nor colored");
+    CHECK(XString_FromFmt(pNoFormat) == NULL, "Nothing is made from no format");
+
+    CHECK(XString_Init(&str, 8, 0) >= 0 && XString_Add(&str, "abc", 3) == 3, "Make a string");
+    CHECK(XString_AddString(&str, NULL) == XSTDERR && str.nLength == 3, "No string is added to it");
+    CHECK(XString_Color(&str, NULL, 0, 1) == XSTDERR && !strcmp(str.pData, "abc"), "Nor is no color");
+    CHECK(XString_Append(&str, pNoFormat) == XSTDERR && XString_InsertFmt(&str, 0, pNoFormat) == XSTDERR,
+        "Nor no format");
+    CHECK(XString_SubStr(&str, NULL, 0, 1) == XSTDERR && XString_CutSub(&str, NULL, "a", "c") == XSTDERR,
+        "A substring needs somewhere to go");
+    CHECK(XString_InitFrom(&sub, pNoFormat) == XSTDERR, "No format initializes nothing");
+    CHECK(XString_Status(&str) == XSTDERR, "A format that fails marks the string, as any failed format does");
+    XString_Clear(&str);
+
+    /* A size an int can not report, and a sum or a doubling past it, are refused rather than wrapped */
+    CHECK(XString_Init(&str, 8, 0) >= 0 && XString_Add(&str, "abc", 3) == 3, "Make a string");
+    CHECK(XString_Resize(&str, (size_t)INT_MAX + 1) == XSTDERR && str.nLength == 3, "A size past an int is refused");
+    CHECK(XString_Increase(&str, SIZE_MAX) == XSTDERR && XString_Increase(&str, (size_t)INT_MAX) == XSTDERR,
+        "So is room that would wrap the size");
+    CHECK(str.nStatus != XSTDERR && !strcmp(str.pData, "abc"), "And the string is left usable");
+    XString_Clear(&str);
+    return 0;
+}
+
+XTEST_MAIN(
+    XTEST_CASE(null_args),
+    XTEST_CASE(guards),
+    XTEST_CASE(build),
+    XTEST_CASE(edit),
+    XTEST_CASE(transform),
+    XTEST_CASE(substrings),
+    XTEST_CASE(tokens),
+    XTEST_CASE(construction),
+    XTEST_CASE(colors),
+    XTEST_CASE(borrowed_copy),
+    XTEST_CASE(borrowed_resize)
+)

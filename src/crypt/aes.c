@@ -1,0 +1,1030 @@
+/*!
+ *  @file libxutils/src/crypt/aes.c
+ *
+ *  This source is part of the "libxutils" project
+ *  2015-2025  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief Implementation of AES encryption based on tiny-AES-c project,
+ * which was released under The Unlicense (public domain dedication).
+ *
+ * Modified for libxutils:
+ * - Refactored code, adjusted style and function API.
+ * - Optimized mixing and status loading, improved 64-byte round trip by 2x.
+ * - Compliance with FIPS-197, SP 800-38A, and RFC 5297. Validated against test vectors.
+ * - Added AES-CBC mode support with PKCS#7 padding.
+ * - Added AES-XBC mode with randomized plaintext prefixing.
+ * - Added AES-SIV (RFC 5297) support for deterministic authenticated encryption.
+ * - Added XAES-S2V (RFC 5297) support to compute synthetic IV from plaintext.
+ * - Added AES-CMAC (RFC 4493) support for synthetic IV derivation.
+ */
+
+#include "xstd.h"
+#include "aes.h"
+
+#ifdef _XUTILS_USE_SSL
+#include <openssl/rand.h>
+#endif
+
+static const uint8_t g_sbox[256] = {
+  0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+  0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+  0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+  0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+  0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+  0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+  0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+  0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+  0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+  0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+  0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+  0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+  0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+  0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+  0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+  0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16 };
+
+static const uint8_t g_rsbox[256] = {
+  0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+  0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+  0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+  0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+  0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+  0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+  0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+  0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+  0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+  0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+  0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+  0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+  0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+  0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+  0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+  0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d };
+
+static const uint8_t g_rcon[11] = {
+  0x8d, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
+
+#define XAES_GetSBoxValue(num) (g_sbox[(num)])
+
+static void XAES_KeyExpansion(xaes_ctx_t *pCtx, const uint8_t* pKey, size_t nKeySize)
+{
+    uint8_t* pRoundKey = pCtx->roundKey;
+    unsigned i, j, k;
+    uint8_t temp[4];
+
+    // The first round key is the pKey itself
+    for (i = 0; i < pCtx->nNK; ++i)
+    {
+        pRoundKey[(i * 4) + 0] = pKey[(i * 4) + 0];
+        pRoundKey[(i * 4) + 1] = pKey[(i * 4) + 1];
+        pRoundKey[(i * 4) + 2] = pKey[(i * 4) + 2];
+        pRoundKey[(i * 4) + 3] = pKey[(i * 4) + 3];
+    }
+
+    // All other round keys are found from the previous round keys
+    for (i = pCtx->nNK; i < pCtx->nNB * (pCtx->nNR + (unsigned)1); ++i)
+    {
+        {
+            k = (i - 1) * 4;
+            temp[0] = pRoundKey[k + 0];
+            temp[1] = pRoundKey[k + 1];
+            temp[2] = pRoundKey[k + 2];
+            temp[3] = pRoundKey[k + 3];
+        }
+
+        if (i % pCtx->nNK == 0)
+        {
+            // RotWord()
+            {
+                const uint8_t u8tmp = temp[0];
+                temp[0] = temp[1];
+                temp[1] = temp[2];
+                temp[2] = temp[3];
+                temp[3] = u8tmp;
+            }
+
+            // Subword()
+            {
+                temp[0] = XAES_GetSBoxValue(temp[0]);
+                temp[1] = XAES_GetSBoxValue(temp[1]);
+                temp[2] = XAES_GetSBoxValue(temp[2]);
+                temp[3] = XAES_GetSBoxValue(temp[3]);
+            }
+
+            temp[0] = temp[0] ^ g_rcon[i / pCtx->nNK];
+        }
+
+        if (nKeySize == 256)
+        {
+            if (i % pCtx->nNK == 4)
+            {
+                // Subword()
+                {
+                    temp[0] = XAES_GetSBoxValue(temp[0]);
+                    temp[1] = XAES_GetSBoxValue(temp[1]);
+                    temp[2] = XAES_GetSBoxValue(temp[2]);
+                    temp[3] = XAES_GetSBoxValue(temp[3]);
+                }
+            }
+        }
+
+        j = i * 4; k = (i - pCtx->nNK) * 4;
+        pRoundKey[j + 0] = pRoundKey[k + 0] ^ temp[0];
+        pRoundKey[j + 1] = pRoundKey[k + 1] ^ temp[1];
+        pRoundKey[j + 2] = pRoundKey[k + 2] ^ temp[2];
+        pRoundKey[j + 3] = pRoundKey[k + 3] ^ temp[3];
+    }
+}
+
+static xbool_t XAES_SystemRand(uint8_t *pBuffer, size_t nSize)
+{
+#ifdef _XUTILS_USE_SSL
+    if (nSize > INT_MAX) return XFALSE;
+    return RAND_bytes((unsigned char*)pBuffer, (int)nSize) == 1;
+#elif defined(_WIN32)
+    HCRYPTPROV provider;
+    if (nSize > MAXDWORD) return XFALSE;
+    if (!CryptAcquireContext(&provider, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) return XFALSE;
+
+    BOOL ok = CryptGenRandom(provider, (DWORD)nSize, (BYTE*)pBuffer);
+    CryptReleaseContext(provider, 0);
+    return ok ? XTRUE : XFALSE;
+#else
+    int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int fd = open("/dev/urandom", flags);
+    if (fd < 0) return XFALSE;
+    size_t offset = 0;
+
+    while (offset < nSize)
+    {
+        ssize_t count = read(fd, pBuffer + offset, nSize - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        offset += (size_t)count;
+    }
+
+    close(fd);
+    return offset == nSize;
+#endif
+}
+
+/* Generated IVs and the XBC random prefix come from the system CSPRNG. They
+   came from rand(), which is predictable (an unseeded program repeats the same
+   sequence on every run), and a CBC IV an attacker can predict lets a chosen
+   plaintext confirm a guess about an earlier block. rand() stays only as the
+   last resort when no system source can be read, so this never fails. */
+static void XAES_Rand(uint8_t* pBuffer, size_t nSize)
+{
+    XCHECK_VOID((pBuffer != NULL));
+    if (!nSize || XAES_SystemRand(pBuffer, nSize)) return;
+
+    for (size_t i = 0; i < nSize; ++i)
+        pBuffer[i] = (uint8_t)(rand() % 256);
+}
+
+static uint8_t XAES_IsUsed(const uint8_t *pBuff)
+{
+    XCHECK_NL((pBuff != NULL), 0);
+    return (pBuff[0] != 0) ? 1 : 0;
+}
+
+void XAES_InitKey(xaes_key_t *pKey, const uint8_t *pAESKey, size_t nKeySize, const uint8_t *pIV, uint8_t bContainIV)
+{
+    XCHECK_VOID((pKey != NULL));
+    memset(pKey, 0, sizeof(xaes_key_t));
+    pKey->nContainIV = bContainIV;
+
+    if (nKeySize == 128 || nKeySize == 192 || nKeySize == 256)
+    {
+        pKey->nKeySize = nKeySize;
+        size_t nKeyLen = nKeySize / 8;
+        memcpy(pKey->aesKey, pAESKey, nKeyLen);
+    }
+
+    if (XAES_IsUsed(pIV)) memcpy(pKey->IV, pIV, XAES_BLOCK_SIZE);
+    else if (bContainIV) XAES_Rand(pKey->IV, XAES_BLOCK_SIZE);
+    else memset(pKey->IV, 0, XAES_BLOCK_SIZE);
+}
+
+void XAES_InitSIVKey(xaes_key_t *pKey, const uint8_t *pMacKey, const uint8_t *pCtrKey, size_t nKeySize)
+{
+    XCHECK_VOID((pKey != NULL));
+    memset(pKey, 0, sizeof(xaes_key_t));
+
+    if (nKeySize == 128 || nKeySize == 192 || nKeySize == 256)
+    {
+        pKey->nKeySize = nKeySize;
+        size_t nKeyLen = nKeySize / 8;
+        memcpy(pKey->aesKey, pMacKey, nKeyLen);
+        memcpy(pKey->ctrKey, pCtrKey, nKeyLen);
+    }
+}
+
+int XAES_Init(xaes_t *pAES, const xaes_key_t *pKey, xaes_mode_t eMode)
+{
+    XCHECK((pAES != NULL), XSTDERR);
+    XCHECK((pKey != NULL), XSTDERR);
+    memset(pAES, 0, sizeof(xaes_t));
+
+    if (pKey->nKeySize == 128)
+    {
+        pAES->ctx.nNB = 4;
+        pAES->ctx.nNK = 4;
+        pAES->ctx.nNR = 10;
+    }
+    else if (pKey->nKeySize == 192)
+    {
+        pAES->ctx.nNB = 4;
+        pAES->ctx.nNK = 6;
+        pAES->ctx.nNR = 12;
+    }
+    else if (pKey->nKeySize == 256)
+    {
+        pAES->ctx.nNB = 4;
+        pAES->ctx.nNK = 8;
+        pAES->ctx.nNR = 14;
+    }
+    else
+    {
+        // Invalid key size
+        return XSTDINV;
+    }
+
+    pAES->mode = eMode;
+    pAES->key = *pKey;
+
+    if (pAES->mode == XAES_MODE_SIV || pAES->mode == XAES_MODE_SIV_NONCE)
+    {
+        xaes_ctx_t cmacCtx;
+        memset(&cmacCtx, 0, sizeof(cmacCtx));
+
+        cmacCtx.nNB = pAES->ctx.nNB;
+        cmacCtx.nNK = pAES->ctx.nNK;
+        cmacCtx.nNR = pAES->ctx.nNR;
+
+        /* Expand CMAC key */
+        XAES_KeyExpansion(&cmacCtx, pKey->aesKey, pKey->nKeySize);
+        memcpy(pAES->ctx.cmacRoundKey, cmacCtx.roundKey, XAES_RKEY_SIZE);
+
+        /* Expand CTR key */
+        XAES_KeyExpansion(&pAES->ctx, pKey->ctrKey, pKey->nKeySize);
+    }
+    else
+    {
+        /* Expand AES key */
+        XAES_KeyExpansion(&pAES->ctx, pKey->aesKey, pKey->nKeySize);
+    }
+
+    return XSTDOK;
+}
+
+void XAES_SetSIVNonce(xaes_t *pAES, const uint8_t *pNonce, size_t nNonceLen)
+{
+    XCHECK_VOID((pAES != NULL));
+    XCHECK_VOID((pNonce != NULL));
+    XCHECK_VOID((nNonceLen == XAES_BLOCK_SIZE));
+
+    /* The nonce reuses the per-context IV slot (unused by SIV/SIVN otherwise)
+       and is consumed by S2V as the associated-data string. */
+    memcpy(pAES->key.IV, pNonce, XAES_BLOCK_SIZE);
+}
+
+/* The state is the 16 byte block in column-major order: byte c * 4 + r is row r of
+   column c. A block is worked on in sixteen locals, so the whole state stays in
+   registers, and SubBytes and ShiftRows are one step that reads each byte from
+   where the row rotation takes it. The lookups are the same S-box ones as a
+   byte at a time implementation makes. */
+#define XAES_XTIME(x) ((uint8_t)(((x) << 1) ^ ((((x) >> 7) & 1) * 0x1b)))
+
+/* MixColumns of one column, XOR'd with four round key bytes */
+#define XAES_MIX(o0, o1, o2, o3, a0, a1, a2, a3, k)                     \
+    do {                                                                \
+        uint8_t nAll = (uint8_t)((a0) ^ (a1) ^ (a2) ^ (a3));            \
+        o0 = (uint8_t)((a0) ^ nAll ^ XAES_XTIME((uint8_t)((a0) ^ (a1))) ^ (k)[0]); \
+        o1 = (uint8_t)((a1) ^ nAll ^ XAES_XTIME((uint8_t)((a1) ^ (a2))) ^ (k)[1]); \
+        o2 = (uint8_t)((a2) ^ nAll ^ XAES_XTIME((uint8_t)((a2) ^ (a3))) ^ (k)[2]); \
+        o3 = (uint8_t)((a3) ^ nAll ^ XAES_XTIME((uint8_t)((a3) ^ (a0))) ^ (k)[3]); \
+    } while (0)
+
+/* InvMixColumns of (column XOR four round key bytes). The inverse matrix is
+   MixColumns applied after multiplying by the circulant {05 00 04 00}, which
+   costs two doublings per pair of bytes instead of a general multiplication. */
+#define XAES_INVMIX(o0, o1, o2, o3, a0, a1, a2, a3, k)                  \
+    do {                                                                \
+        uint8_t b0 = (uint8_t)((a0) ^ (k)[0]), b1 = (uint8_t)((a1) ^ (k)[1]); \
+        uint8_t b2 = (uint8_t)((a2) ^ (k)[2]), b3 = (uint8_t)((a3) ^ (k)[3]); \
+        uint8_t nU = XAES_XTIME(XAES_XTIME((uint8_t)(b0 ^ b2)));        \
+        uint8_t nV = XAES_XTIME(XAES_XTIME((uint8_t)(b1 ^ b3)));        \
+        b0 ^= nU; b1 ^= nV; b2 ^= nU; b3 ^= nV;                         \
+        XAES_MIX(o0, o1, o2, o3, b0, b1, b2, b3, nZero);                \
+    } while (0)
+
+#define XAES_LOAD_STATE(p, k)                                                           \
+    uint8_t s0 = (uint8_t)((p)[0] ^ (k)[0]), s1 = (uint8_t)((p)[1] ^ (k)[1]);           \
+    uint8_t s2 = (uint8_t)((p)[2] ^ (k)[2]), s3 = (uint8_t)((p)[3] ^ (k)[3]);           \
+    uint8_t s4 = (uint8_t)((p)[4] ^ (k)[4]), s5 = (uint8_t)((p)[5] ^ (k)[5]);           \
+    uint8_t s6 = (uint8_t)((p)[6] ^ (k)[6]), s7 = (uint8_t)((p)[7] ^ (k)[7]);           \
+    uint8_t s8 = (uint8_t)((p)[8] ^ (k)[8]), s9 = (uint8_t)((p)[9] ^ (k)[9]);           \
+    uint8_t s10 = (uint8_t)((p)[10] ^ (k)[10]), s11 = (uint8_t)((p)[11] ^ (k)[11]);     \
+    uint8_t s12 = (uint8_t)((p)[12] ^ (k)[12]), s13 = (uint8_t)((p)[13] ^ (k)[13]);     \
+    uint8_t s14 = (uint8_t)((p)[14] ^ (k)[14]), s15 = (uint8_t)((p)[15] ^ (k)[15])
+
+#define XAES_STORE_STATE(p, k)                                                          \
+    do {                                                                                \
+        (p)[0] = (uint8_t)(t0 ^ (k)[0]);   (p)[1] = (uint8_t)(t1 ^ (k)[1]);             \
+        (p)[2] = (uint8_t)(t2 ^ (k)[2]);   (p)[3] = (uint8_t)(t3 ^ (k)[3]);             \
+        (p)[4] = (uint8_t)(t4 ^ (k)[4]);   (p)[5] = (uint8_t)(t5 ^ (k)[5]);             \
+        (p)[6] = (uint8_t)(t6 ^ (k)[6]);   (p)[7] = (uint8_t)(t7 ^ (k)[7]);             \
+        (p)[8] = (uint8_t)(t8 ^ (k)[8]);   (p)[9] = (uint8_t)(t9 ^ (k)[9]);             \
+        (p)[10] = (uint8_t)(t10 ^ (k)[10]); (p)[11] = (uint8_t)(t11 ^ (k)[11]);         \
+        (p)[12] = (uint8_t)(t12 ^ (k)[12]); (p)[13] = (uint8_t)(t13 ^ (k)[13]);         \
+        (p)[14] = (uint8_t)(t14 ^ (k)[14]); (p)[15] = (uint8_t)(t15 ^ (k)[15]);         \
+    } while (0)
+
+static void XAES_CipherBlock(uint8_t nNR, uint8_t nNB, const uint8_t* pRoundKey, uint8_t* pBuffer)
+{
+    const size_t nStride = (size_t)nNB * 4;
+    XAES_LOAD_STATE(pBuffer, pRoundKey);
+    uint8_t nRound;
+
+    for (nRound = 1; ; ++nRound)
+    {
+        const uint8_t *pKey = pRoundKey + nRound * nStride;
+
+        /* SubBytes and ShiftRows */
+        uint8_t t0 = g_sbox[s0], t1 = g_sbox[s5], t2 = g_sbox[s10], t3 = g_sbox[s15];
+        uint8_t t4 = g_sbox[s4], t5 = g_sbox[s9], t6 = g_sbox[s14], t7 = g_sbox[s3];
+        uint8_t t8 = g_sbox[s8], t9 = g_sbox[s13], t10 = g_sbox[s2], t11 = g_sbox[s7];
+        uint8_t t12 = g_sbox[s12], t13 = g_sbox[s1], t14 = g_sbox[s6], t15 = g_sbox[s11];
+
+        if (nRound == nNR)
+        {
+            XAES_STORE_STATE(pBuffer, pKey);
+            return;
+        }
+
+        XAES_MIX(s0, s1, s2, s3, t0, t1, t2, t3, pKey);
+        XAES_MIX(s4, s5, s6, s7, t4, t5, t6, t7, pKey + 4);
+        XAES_MIX(s8, s9, s10, s11, t8, t9, t10, t11, pKey + 8);
+        XAES_MIX(s12, s13, s14, s15, t12, t13, t14, t15, pKey + 12);
+    }
+}
+
+void XAES_ECB_Crypt(const xaes_t* pAES, uint8_t* pBuffer)
+{
+    XCHECK_VOID_NL((pAES != NULL && pBuffer != NULL));
+    const xaes_ctx_t *pCtx = &pAES->ctx;
+    XAES_CipherBlock(pCtx->nNR, pCtx->nNB, pCtx->roundKey, pBuffer);
+}
+
+void XAES_ECB_Decrypt(const xaes_t* pAES, uint8_t* pBuffer)
+{
+    XCHECK_VOID_NL((pAES != NULL && pBuffer != NULL));
+    const xaes_ctx_t *pCtx = &pAES->ctx;
+    const uint8_t* pRoundKey = pCtx->roundKey;
+    const size_t nStride = (size_t)pCtx->nNB * 4;
+    const uint8_t nZero[4] = { 0, 0, 0, 0 };
+
+    XAES_LOAD_STATE(pBuffer, pRoundKey + pCtx->nNR * nStride);
+    uint8_t nRound;
+
+    for (nRound = (pCtx->nNR - 1); ; --nRound)
+    {
+        const uint8_t *pKey = pRoundKey + nRound * nStride;
+
+        /* InvShiftRows and InvSubBytes */
+        uint8_t t0 = g_rsbox[s0], t1 = g_rsbox[s13], t2 = g_rsbox[s10], t3 = g_rsbox[s7];
+        uint8_t t4 = g_rsbox[s4], t5 = g_rsbox[s1], t6 = g_rsbox[s14], t7 = g_rsbox[s11];
+        uint8_t t8 = g_rsbox[s8], t9 = g_rsbox[s5], t10 = g_rsbox[s2], t11 = g_rsbox[s15];
+        uint8_t t12 = g_rsbox[s12], t13 = g_rsbox[s9], t14 = g_rsbox[s6], t15 = g_rsbox[s3];
+
+        if (nRound == 0)
+        {
+            XAES_STORE_STATE(pBuffer, pKey);
+            return;
+        }
+
+        XAES_INVMIX(s0, s1, s2, s3, t0, t1, t2, t3, pKey);
+        XAES_INVMIX(s4, s5, s6, s7, t4, t5, t6, t7, pKey + 4);
+        XAES_INVMIX(s8, s9, s10, s11, t8, t9, t10, t11, pKey + 8);
+        XAES_INVMIX(s12, s13, s14, s15, t12, t13, t14, t15, pKey + 12);
+    }
+}
+
+static void XAES_ApplyXOR(uint8_t* pBuffer, const uint8_t* pIV)
+{
+    uint8_t i;
+
+    for (i = 0; i < XAES_BLOCK_SIZE; ++i)
+    {
+        pBuffer[i] ^= pIV[i];
+    }
+}
+
+/* Constant-time comparison to prevent timing side-channel attacks */
+static uint8_t XAES_ConstTimeEqual(const uint8_t *pA, const uint8_t *pB, size_t nLength)
+{
+    uint8_t nDiff = 0;
+    size_t i;
+
+    for (i = 0; i < nLength; i++)
+        nDiff |= pA[i] ^ pB[i];
+
+    return (nDiff == 0);
+}
+
+/* Wipes key derived bytes through a volatile pointer, which the compiler can not drop as a dead store */
+static void XAES_Wipe(void *pData, size_t nSize)
+{
+    volatile uint8_t *pByte = (volatile uint8_t*)pData;
+    while (nSize--) *pByte++ = 0;
+}
+
+/* Doubling operation in GF(2^128): left shift by 1, conditional XOR with Rb */
+static void XAES_DBL(uint8_t *pBlock)
+{
+    uint8_t nCarry = 0;
+    int i;
+
+    for (i = XAES_BLOCK_SIZE - 1; i >= 0; i--)
+    {
+        uint8_t nNewCarry = (pBlock[i] >> 7) & 1;
+        pBlock[i] = (uint8_t)((pBlock[i] << 1) | nCarry);
+        nCarry = nNewCarry;
+    }
+
+    /* If MSB was set, XOR last byte with Rb constant */
+    if (nCarry) pBlock[XAES_BLOCK_SIZE - 1] ^= XAES_CMAC_RB;
+}
+
+/* Generate CMAC subkeys K1 and K2 from the CMAC round key */
+static void XAES_CMAC_SubKeys(const xaes_t *pAES, uint8_t *pK1, uint8_t *pK2)
+{
+    const xaes_ctx_t *pCtx = &pAES->ctx;
+    uint8_t L[XAES_BLOCK_SIZE];
+    memset(L, 0, XAES_BLOCK_SIZE);
+
+    /* L = AES-ECB(K, 0^128) */
+    XAES_CipherBlock(pCtx->nNR, pCtx->nNB, pCtx->cmacRoundKey, L);
+
+    /* K1 = dbl(L) */
+    memcpy(pK1, L, XAES_BLOCK_SIZE);
+    XAES_DBL(pK1);
+
+    /* K2 = dbl(K1) */
+    memcpy(pK2, pK1, XAES_BLOCK_SIZE);
+    XAES_DBL(pK2);
+    XAES_Wipe(L, sizeof(L));
+}
+
+/* Compute AES-CMAC tag over message using the CMAC round key from context and
+   the subkeys K1 and K2 derived from it. With pTweak, the last 16 bytes of the
+   message (which must be at least that long) are taken XOR'd with the tweak,
+   which is how S2V folds its running value into the final string. */
+static void XAES_CMAC(const xaes_t *pAES, const uint8_t *K1, const uint8_t *K2,
+                      const uint8_t *pData, size_t nLength, const uint8_t *pTweak, uint8_t *pTag)
+{
+    uint8_t X[XAES_BLOCK_SIZE];
+    size_t i, nBlocks, nLastBlockLen;
+    size_t nTweakFrom = pTweak != NULL ? nLength - XAES_BLOCK_SIZE : nLength;
+    uint8_t bComplete;
+
+    /* Number of blocks (ceil division, minimum 1) */
+    nBlocks = (nLength + XAES_BLOCK_SIZE - 1) / XAES_BLOCK_SIZE;
+    if (nBlocks == 0) nBlocks = 1;
+
+    nLastBlockLen = nLength - (nBlocks - 1) * XAES_BLOCK_SIZE;
+    bComplete = (nLastBlockLen == XAES_BLOCK_SIZE && nLength > 0) ? 1 : 0;
+
+    /* Process all blocks except the last */
+    memset(X, 0, XAES_BLOCK_SIZE);
+    const xaes_ctx_t *pCtx = &pAES->ctx;
+
+    for (i = 0; i < nBlocks - 1; i++)
+    {
+        size_t nOffset = i * XAES_BLOCK_SIZE;
+        XAES_ApplyXOR(X, pData + nOffset);
+
+        /* The tweaked tail can start inside a block that is not the last one */
+        if (nOffset + XAES_BLOCK_SIZE > nTweakFrom)
+        {
+            size_t j;
+            for (j = nTweakFrom > nOffset ? nTweakFrom - nOffset : 0; j < XAES_BLOCK_SIZE; j++)
+                X[j] ^= pTweak[nOffset + j - nTweakFrom];
+        }
+
+        XAES_CipherBlock(pCtx->nNR, pCtx->nNB, pCtx->cmacRoundKey, X);
+    }
+
+    /* Process last block */
+    uint8_t lastBlock[XAES_BLOCK_SIZE];
+    size_t nLastOffset = (nBlocks - 1) * XAES_BLOCK_SIZE;
+    const uint8_t *pLastData = pData + nLastOffset;
+
+    if (bComplete)
+    {
+        /* Complete block: XOR with K1 */
+        memcpy(lastBlock, pLastData, XAES_BLOCK_SIZE);
+        XAES_ApplyXOR(lastBlock, K1);
+    }
+    else
+    {
+        /* Incomplete block: pad with 10...0, XOR with K2 */
+        memset(lastBlock, 0, XAES_BLOCK_SIZE);
+        if (nLastBlockLen > 0)
+            memcpy(lastBlock, pLastData, nLastBlockLen);
+        lastBlock[nLastBlockLen] = 0x80;
+        XAES_ApplyXOR(lastBlock, K2);
+    }
+
+    if (pTweak != NULL)
+    {
+        size_t j;
+        for (j = nTweakFrom > nLastOffset ? nTweakFrom - nLastOffset : 0; j < nLastBlockLen; j++)
+            lastBlock[j] ^= pTweak[nLastOffset + j - nTweakFrom];
+    }
+
+    XAES_ApplyXOR(X, lastBlock);
+    XAES_CipherBlock(pCtx->nNR, pCtx->nNB, pCtx->cmacRoundKey, X);
+
+    memcpy(pTag, X, XAES_BLOCK_SIZE);
+}
+
+/* S2V: Compute synthetic IV from plaintext (RFC 5297, Section 2.4).
+ * XAES_MODE_SIV uses no associated data. XAES_MODE_SIV_NONCE folds
+ * in a single associated-data string (the nonce in pAES->key.IV)
+ * so identical plaintexts produce distinct synthetic IVs. */
+static int XAES_S2V(const xaes_t *pAES, const uint8_t *pPlain, size_t nLength, uint8_t *pSIV)
+{
+    uint8_t K1[XAES_BLOCK_SIZE], K2[XAES_BLOCK_SIZE];
+    uint8_t D[XAES_BLOCK_SIZE];
+    uint8_t zeroBlock[XAES_BLOCK_SIZE];
+    memset(zeroBlock, 0, XAES_BLOCK_SIZE);
+
+    /* Every CMAC below uses the same key, and so the same subkeys */
+    XAES_CMAC_SubKeys(pAES, K1, K2);
+
+    /* D = CMAC(K, 0^128) */
+    XAES_CMAC(pAES, K1, K2, zeroBlock, XAES_BLOCK_SIZE, NULL, D);
+
+    /* Process the lone associated-data string (the nonce) for nonce-based SIV:
+     * D = dbl(D) XOR CMAC(K, nonce). RFC 5297, Section 2.4. */
+    if (pAES->mode == XAES_MODE_SIV_NONCE)
+    {
+        uint8_t macNonce[XAES_BLOCK_SIZE];
+        XAES_CMAC(pAES, K1, K2, pAES->key.IV, XAES_BLOCK_SIZE, NULL, macNonce);
+        XAES_DBL(D);
+        XAES_ApplyXOR(D, macNonce);
+    }
+
+    if (nLength >= XAES_BLOCK_SIZE)
+    {
+        /* T = plaintext with last 16 bytes XOR'd with D, applied while the
+           plaintext is read rather than on a copy of it */
+        XAES_CMAC(pAES, K1, K2, pPlain, nLength, D, pSIV);
+    }
+    else
+    {
+        /* T = dbl(D) XOR pad(plaintext) */
+        uint8_t T[XAES_BLOCK_SIZE];
+        XAES_DBL(D);
+
+        memset(T, 0, XAES_BLOCK_SIZE);
+        if (nLength > 0) memcpy(T, pPlain, nLength);
+        T[nLength] = 0x80;
+
+        XAES_ApplyXOR(T, D);
+        XAES_CMAC(pAES, K1, K2, T, XAES_BLOCK_SIZE, NULL, pSIV);
+        XAES_Wipe(T, sizeof(T));
+    }
+
+    XAES_Wipe(K1, sizeof(K1));
+    XAES_Wipe(K2, sizeof(K2));
+    XAES_Wipe(D, sizeof(D));
+    return XSTDOK;
+}
+
+/* AES-CTR encryption/decryption using SIV as initial counter (RFC 5297, Section 2.6) */
+static void XAES_SIV_CTR(const xaes_t *pAES, const uint8_t *pSIV,
+                          const uint8_t *pInput, uint8_t *pOutput, size_t nLength)
+{
+    const xaes_ctx_t *pCtx = &pAES->ctx;
+    uint8_t counter[XAES_BLOCK_SIZE];
+    uint8_t keystream[XAES_BLOCK_SIZE];
+    size_t nOffset = 0;
+
+    /* Initialize counter: clear bits 31 and 63 of SIV */
+    memcpy(counter, pSIV, XAES_BLOCK_SIZE);
+    counter[8] &= 0x7F;  /* Clear bit 63 */
+    counter[12] &= 0x7F; /* Clear bit 31 */
+
+    while (nOffset < nLength)
+    {
+        size_t nBlockLen = nLength - nOffset;
+        if (nBlockLen > XAES_BLOCK_SIZE)
+            nBlockLen = XAES_BLOCK_SIZE;
+
+        /* Generate keystream block */
+        memcpy(keystream, counter, XAES_BLOCK_SIZE);
+        XAES_CipherBlock(pCtx->nNR, pCtx->nNB, pCtx->roundKey, keystream);
+
+        /* XOR input with keystream */
+        size_t i;
+        for (i = 0; i < nBlockLen; i++)
+            pOutput[nOffset + i] = pInput[nOffset + i] ^ keystream[i];
+
+        nOffset += nBlockLen;
+
+        /* Increment counter (big-endian, last 4 bytes) */
+        int j;
+        for (j = XAES_BLOCK_SIZE - 1; j >= 12; j--)
+        {
+            if (++counter[j] != 0) break;
+        }
+    }
+}
+
+uint8_t* XAES_SIV_Crypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pAES != NULL), NULL);
+    XCHECK((pInput != NULL), NULL);
+    XCHECK((pLength != NULL), NULL);
+
+    size_t nInputLen = *pLength;
+    XCHECK((nInputLen <= (SIZE_MAX - XAES_BLOCK_SIZE - 1)), NULL);
+    size_t nOutLen = XAES_BLOCK_SIZE + nInputLen; /* SIV tag + ciphertext */
+
+    uint8_t *pOutput = (uint8_t*)malloc(nOutLen + 1);
+    XCHECK((pOutput != NULL), NULL);
+
+    /* Compute SIV tag from plaintext */
+    uint8_t siv[XAES_BLOCK_SIZE];
+    XSTATUS status;
+
+    status = XAES_S2V(pAES, pInput, nInputLen, siv);
+    XCHECK_FREE((status == XSTDOK), pOutput, NULL);
+
+    /* Prepend SIV tag to output */
+    memcpy(pOutput, siv, XAES_BLOCK_SIZE);
+
+    /* CTR-encrypt plaintext using SIV as counter */
+    XAES_SIV_CTR(pAES, siv, pInput, pOutput + XAES_BLOCK_SIZE, nInputLen);
+
+    /* Output is binary. It must be processed using *pLength variable only.
+     * We append a trailing 0 byte purely as a safety guard to reduce the
+     * risk of undefined behavior if someone mistakenly treats it as a C string.
+     */
+    pOutput[nOutLen] = 0;
+    *pLength = nOutLen;
+
+    return pOutput;
+}
+
+uint8_t* XAES_SIV_Decrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pAES != NULL), NULL);
+    XCHECK((pInput != NULL), NULL);
+    XCHECK((pLength != NULL && *pLength > 0), NULL);
+
+    size_t nInputLen = *pLength; /* Need at least SIV tag + 1 byte */
+    XCHECK_NL((nInputLen > XAES_BLOCK_SIZE), NULL);
+
+    /* Extract SIV tag and ciphertext */
+    const uint8_t *pSIV = pInput;
+    const uint8_t *pCiphertext = pInput + XAES_BLOCK_SIZE;
+    size_t nCipherLen = nInputLen - XAES_BLOCK_SIZE;
+
+    uint8_t *pOutput = (uint8_t*)malloc(nCipherLen + 1);
+    XCHECK((pOutput != NULL), NULL);
+
+    /* CTR-decrypt ciphertext using SIV as counter */
+    XAES_SIV_CTR(pAES, pSIV, pCiphertext, pOutput, nCipherLen);
+
+    /* Verify SIV tag: recompute from decrypted plaintext */
+    uint8_t sivCheck[XAES_BLOCK_SIZE];
+    XSTATUS status;
+
+    status = XAES_S2V(pAES, pOutput, nCipherLen, sivCheck);
+    XCHECK_FREE((status == XSTDOK), pOutput, NULL);
+
+    if (!XAES_ConstTimeEqual(sivCheck, pSIV, XAES_BLOCK_SIZE))
+    {
+        /* Authentication failed */
+        free(pOutput);
+        return NULL;
+    }
+
+    pOutput[nCipherLen] = 0;
+    *pLength = nCipherLen;
+
+    return pOutput;
+}
+
+uint8_t* XAES_CBC_Crypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pAES != NULL), NULL);
+    XCHECK((pInput != NULL), NULL);
+    XCHECK((pLength != NULL && *pLength > 0), NULL);
+
+    size_t nOriginalLen = *pLength;
+    size_t nPaddingLen = XAES_BLOCK_SIZE - nOriginalLen % XAES_BLOCK_SIZE;
+    size_t nPrefix = pAES->key.nContainIV ? XAES_BLOCK_SIZE : 0;
+    if (nOriginalLen > SIZE_MAX - nPrefix - nPaddingLen - 1) return NULL;
+    size_t nNewLength = nOriginalLen + nPaddingLen;
+    size_t nOutLen = nPrefix + nNewLength;
+
+    uint8_t *pOutput = (uint8_t*)malloc(nOutLen + 1);
+    XCHECK((pOutput != NULL), NULL);
+
+    uint8_t iv[XAES_BLOCK_SIZE];
+    memcpy(iv, pAES->key.IV, sizeof(iv));
+
+    if (pAES->key.nContainIV)
+        memcpy(pOutput, iv, XAES_BLOCK_SIZE);
+
+    /* Copy input and add PKCS#7 padding */
+    uint8_t *pOffset = pOutput + nPrefix;
+    memcpy(pOffset, pInput, nOriginalLen);
+
+    uint8_t nPadding = (uint8_t)(nNewLength - nOriginalLen);
+    memset(pOffset + nOriginalLen, nPadding, nPadding);
+
+    while (nNewLength > 0)
+    {
+        XAES_ApplyXOR(pOffset, iv);
+        XAES_ECB_Crypt(pAES, pOffset);
+        memcpy(iv, pOffset, XAES_BLOCK_SIZE);
+
+        nNewLength -= XAES_BLOCK_SIZE;
+        pOffset += XAES_BLOCK_SIZE;
+    }
+
+    if (!pAES->key.nContainIV)
+        memcpy(pAES->key.IV, iv, XAES_BLOCK_SIZE);
+
+    /* Output is binary. It must be processed using *pLength variable only.
+     * We append a trailing 0 byte purely as a safety guard to reduce the
+     * risk of undefined behavior if someone mistakenly treats it as a C string.
+     */
+    pOutput[nOutLen] = 0;
+    *pLength = nOutLen;
+
+    return pOutput;
+}
+
+uint8_t* XAES_CBC_Decrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pAES != NULL), NULL);
+    XCHECK((pInput != NULL), NULL);
+    XCHECK((pLength != NULL && *pLength > 0), NULL);
+
+    size_t nInputLength = *pLength;
+    uint8_t iv[XAES_BLOCK_SIZE] = { 0 };
+
+    if (pAES->key.nContainIV)
+    {
+        if (nInputLength <= XAES_BLOCK_SIZE) return NULL;
+        size_t nCipherLen = nInputLength - XAES_BLOCK_SIZE;
+        if ((nCipherLen % XAES_BLOCK_SIZE) != 0) return NULL;
+
+        memcpy(iv, pInput, XAES_BLOCK_SIZE);
+        pInput += XAES_BLOCK_SIZE;
+        nInputLength = nCipherLen;
+    }
+    else
+    {
+        if (nInputLength < XAES_BLOCK_SIZE) return NULL;
+        if (nInputLength % XAES_BLOCK_SIZE != 0) return NULL;
+        memcpy(iv, pAES->key.IV, sizeof(iv));
+    }
+
+    uint8_t *pOutput = (uint8_t*)malloc(nInputLength + 1);
+    XCHECK((pOutput != NULL), NULL);
+
+    memcpy(pOutput, pInput, nInputLength);
+    uint8_t *pOffset = pOutput;
+    size_t nDataLeft = nInputLength;
+
+    while (nDataLeft > 0)
+    {
+        uint8_t ivTmp[XAES_BLOCK_SIZE];
+        memcpy(ivTmp, pOffset, XAES_BLOCK_SIZE);
+        XAES_ECB_Decrypt(pAES, pOffset);
+
+        XAES_ApplyXOR(pOffset, iv);
+        memcpy(iv, ivTmp, XAES_BLOCK_SIZE);
+
+        nDataLeft -= XAES_BLOCK_SIZE;
+        pOffset += XAES_BLOCK_SIZE;
+    }
+
+    // Remove PKCS#7 padding
+    uint8_t nPadding = pOutput[nInputLength - 1];
+    if (!nPadding || nPadding > XAES_BLOCK_SIZE)
+    {
+        free(pOutput);
+        return NULL;
+    }
+
+    size_t i;
+    for (i = 0; i < nPadding; i++)
+    {
+        if (pOutput[nInputLength - 1 - i] != nPadding)
+        {
+            free(pOutput);
+            return NULL;
+        }
+    }
+
+    if (!pAES->key.nContainIV)
+        memcpy(pAES->key.IV, iv, XAES_BLOCK_SIZE);
+
+    *pLength = nInputLength - nPadding;
+    pOutput[*pLength] = 0;
+
+    return pOutput;
+}
+
+uint8_t* XAES_XBC_Crypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pAES != NULL), NULL);
+    XCHECK((pInput != NULL), NULL);
+    XCHECK((pLength != NULL && *pLength > 0), NULL);
+
+    size_t nPlainLen = *pLength;
+    size_t nKnownLen = (XAES_XBC_HDR_SIZE + nPlainLen % XAES_BLOCK_SIZE) % XAES_BLOCK_SIZE;
+    size_t nRandLen = (XAES_BLOCK_SIZE - nKnownLen) % XAES_BLOCK_SIZE;
+    size_t nPrefix = pAES->key.nContainIV ? XAES_BLOCK_SIZE : 0;
+    if (nPlainLen > SIZE_MAX - nPrefix - XAES_XBC_HDR_SIZE - nRandLen - 1) return NULL;
+    size_t nTotalLen = XAES_XBC_HDR_SIZE + nRandLen + nPlainLen;
+    size_t nOutLen = nPrefix + nTotalLen;
+
+    uint8_t *pOutput = (uint8_t*)malloc(nOutLen + 1);
+    XCHECK((pOutput != NULL), NULL);
+
+    uint8_t iv[XAES_BLOCK_SIZE];
+    memcpy(iv, pAES->key.IV, sizeof(iv));
+
+    if (pAES->key.nContainIV)
+        memcpy(pOutput, iv, XAES_BLOCK_SIZE);
+
+    /* Build aligned plaintext: [4 byte rand_len][random][plaintext] */
+    uint8_t *pOffset = pOutput + nPrefix;
+
+    /* Store random prefix length as big-endian uint32 */
+    pOffset[0] = (uint8_t)((nRandLen >> 24) & 0xFF);
+    pOffset[1] = (uint8_t)((nRandLen >> 16) & 0xFF);
+    pOffset[2] = (uint8_t)((nRandLen >> 8) & 0xFF);
+    pOffset[3] = (uint8_t)(nRandLen & 0xFF);
+
+    /* Fill random prefix */
+    XAES_Rand(pOffset + XAES_XBC_HDR_SIZE, nRandLen);
+
+    /* Copy plaintext after header and random prefix */
+    memcpy(pOffset + XAES_XBC_HDR_SIZE + nRandLen, pInput, nPlainLen);
+
+    /* CBC-encrypt the aligned data (no PKCS#7 padding needed) */
+    size_t nLeft = nTotalLen;
+    while (nLeft > 0)
+    {
+        XAES_ApplyXOR(pOffset, iv);
+        XAES_ECB_Crypt(pAES, pOffset);
+        memcpy(iv, pOffset, XAES_BLOCK_SIZE);
+
+        nLeft -= XAES_BLOCK_SIZE;
+        pOffset += XAES_BLOCK_SIZE;
+    }
+
+    if (!pAES->key.nContainIV)
+        memcpy(pAES->key.IV, iv, XAES_BLOCK_SIZE);
+
+    /* Output is binary. It must be processed using *pLength variable only.
+     * We append a trailing 0 byte purely as a safety guard to reduce the
+     * risk of undefined behavior if someone mistakenly treats it as a C string.
+     */
+    pOutput[nOutLen] = 0;
+    *pLength = nOutLen;
+
+    return pOutput;
+}
+
+uint8_t* XAES_XBC_Decrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pAES != NULL), NULL);
+    XCHECK((pInput != NULL), NULL);
+    XCHECK((pLength != NULL && *pLength > 0), NULL);
+
+    size_t nInputLength = *pLength;
+    uint8_t iv[XAES_BLOCK_SIZE] = { 0 };
+
+    if (pAES->key.nContainIV)
+    {
+        if (nInputLength <= XAES_BLOCK_SIZE) return NULL;
+        size_t nCipherLen = nInputLength - XAES_BLOCK_SIZE;
+        if ((nCipherLen % XAES_BLOCK_SIZE) != 0) return NULL;
+
+        memcpy(iv, pInput, XAES_BLOCK_SIZE);
+        pInput += XAES_BLOCK_SIZE;
+        nInputLength = nCipherLen;
+    }
+    else
+    {
+        if (nInputLength < XAES_BLOCK_SIZE) return NULL;
+        if (nInputLength % XAES_BLOCK_SIZE != 0) return NULL;
+        memcpy(iv, pAES->key.IV, sizeof(iv));
+    }
+
+    /* Need at least one block to hold the 4-byte header */
+    if (nInputLength < XAES_BLOCK_SIZE) return NULL;
+
+    uint8_t *pDecrypted = (uint8_t*)malloc(nInputLength + 1);
+    XCHECK((pDecrypted != NULL), NULL);
+
+    /* CBC-decrypt (no PKCS#7 unpadding) */
+    memcpy(pDecrypted, pInput, nInputLength);
+    uint8_t *pOffset = pDecrypted;
+    size_t nDataLeft = nInputLength;
+
+    while (nDataLeft > 0)
+    {
+        uint8_t ivTmp[XAES_BLOCK_SIZE];
+        memcpy(ivTmp, pOffset, XAES_BLOCK_SIZE);
+        XAES_ECB_Decrypt(pAES, pOffset);
+
+        XAES_ApplyXOR(pOffset, iv);
+        memcpy(iv, ivTmp, XAES_BLOCK_SIZE);
+
+        nDataLeft -= XAES_BLOCK_SIZE;
+        pOffset += XAES_BLOCK_SIZE;
+    }
+
+    if (!pAES->key.nContainIV)
+        memcpy(pAES->key.IV, iv, XAES_BLOCK_SIZE);
+
+    /* Read random prefix length from header (big-endian uint32) */
+    uint32_t nRandLen = ((uint32_t)pDecrypted[0] << 24) |
+                        ((uint32_t)pDecrypted[1] << 16) |
+                        ((uint32_t)pDecrypted[2] << 8) |
+                        (uint32_t)pDecrypted[3];
+
+    /* Validate: random prefix must fit within the decrypted data */
+    if (nRandLen > nInputLength - XAES_XBC_HDR_SIZE)
+    {
+        free(pDecrypted);
+        return NULL;
+    }
+
+    /* Extract plaintext: skip header and random prefix */
+    size_t nSkip = XAES_XBC_HDR_SIZE + nRandLen;
+    size_t nPlainLen = nInputLength - nSkip;
+
+    uint8_t *pOutput = (uint8_t*)malloc(nPlainLen + 1);
+    if (pOutput == NULL)
+    {
+        free(pDecrypted);
+        return NULL;
+    }
+
+    memcpy(pOutput, pDecrypted + nSkip, nPlainLen);
+    free(pDecrypted);
+
+    pOutput[nPlainLen] = 0;
+    *pLength = nPlainLen;
+
+    return pOutput;
+}
+
+uint8_t* XAES_Encrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pAES != NULL), NULL);
+    XCHECK((pInput != NULL), NULL);
+    XCHECK((pLength != NULL), NULL);
+
+    if (pAES->mode == XAES_MODE_SIV ||
+        pAES->mode == XAES_MODE_SIV_NONCE)
+        return XAES_SIV_Crypt(pAES, pInput, pLength);
+
+    if (pAES->mode == XAES_MODE_XBC)
+        return XAES_XBC_Crypt(pAES, pInput, pLength);
+
+    return XAES_CBC_Crypt(pAES, pInput, pLength);
+}
+
+uint8_t* XAES_Decrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pAES != NULL), NULL);
+    XCHECK((pInput != NULL), NULL);
+    XCHECK((pLength != NULL), NULL);
+
+    if (pAES->mode == XAES_MODE_SIV ||
+        pAES->mode == XAES_MODE_SIV_NONCE)
+        return XAES_SIV_Decrypt(pAES, pInput, pLength);
+
+    if (pAES->mode == XAES_MODE_XBC)
+        return XAES_XBC_Decrypt(pAES, pInput, pLength);
+
+    return XAES_CBC_Decrypt(pAES, pInput, pLength);
+}

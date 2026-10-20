@@ -1,0 +1,34 @@
+/* libxutils: parser fuzz targets shared by the harness and the corpus generator. */
+#ifndef XUTILS_FUZZ_PARSERS_H
+#define XUTILS_FUZZ_PARSERS_H
+
+/* The first byte of every input selects the parser, so seeds and harness must
+ * agree on the order. Appending a target keeps older corpus entries valid. */
+typedef enum {
+    XFUZZ_TARGET_JSON = 0,
+    XFUZZ_TARGET_HTTP,
+    XFUZZ_TARGET_WS,
+    XFUZZ_TARGET_BASE64,
+    XFUZZ_TARGET_JWT,
+    XFUZZ_TARGET_URL,
+    XFUZZ_TARGET_MDTP,
+    XFUZZ_TARGET_RTP,
+    XFUZZ_TARGET_UNIX_URL,
+    XFUZZ_TARGET_GLOB,
+    XFUZZ_TARGET_HTTP_STREAM,
+    XFUZZ_TARGET_MDTP_STREAM,
+    XFUZZ_TARGET_WS_STREAM,
+    XFUZZ_TARGET_STR_OPS,
+    XFUZZ_TARGET_TIME,
+    XFUZZ_TARGET_PATH,
+    XFUZZ_TARGET_HEX,
+    XFUZZ_TARGET_JSON_ROUNDTRIP,
+    XFUZZ_TARGET_HTTP_HEADERS,
+    XFUZZ_TARGET_DIGEST,
+    XFUZZ_TARGET_AES,
+    XFUZZ_TARGET_FORMAT,
+    XFUZZ_TARGET_JSON_SCAN,
+    XFUZZ_TARGET_COUNT
+} xfuzz_target_t;
+
+#endif

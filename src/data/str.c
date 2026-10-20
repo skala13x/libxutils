@@ -1,0 +1,2234 @@
+/*!
+ *  @file libxutils/src/data/str.c
+ *
+ *  This source is part of the "libxutils" project
+ *  2015-2020  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief This source includes string operations.
+ */
+
+#ifdef _XUTILS_USE_GNU
+#define _GNU_SOURCE
+#endif
+
+#include "str.h"
+
+/////////////////////////////////////////////////////////////////////////
+// C string functions
+/////////////////////////////////////////////////////////////////////////
+
+char *xstrtok(char* pString, const char* pDelimiter, char **pContext)
+{
+    /* No string continues the one the context holds, it needs no check */
+    if (pDelimiter == NULL || pContext == NULL) return NULL;
+#ifdef _WIN32
+    return strtok_s(pString, pDelimiter, pContext);
+#else
+    return strtok_r(pString, pDelimiter, pContext);
+#endif
+}
+
+size_t xstrarglen(const char *pFmt, va_list args)
+{
+    if (pFmt == NULL) return 0;
+    va_list locArgs;
+#ifdef va_copy
+    va_copy(locArgs, args);
+#else
+    memcpy(&locArgs, &args, sizeof(va_list));
+#endif
+
+    int nLength = vsnprintf(0, 0, pFmt, locArgs);
+
+#ifndef _XUTILS_USE_EXT
+    /* A format vsnprintf() rejects reports -1, which as a length is SIZE_MAX:
+       the callers then allocated nothing (SIZE_MAX + 1) and reported a length
+       of SIZE_MAX for it. Nothing can be formatted, so the length is zero. */
+    if (nLength < 0) nLength = 0;
+#endif
+
+#ifdef _XUTILS_USE_EXT
+    if (nLength > 0)
+    {
+        va_end(locArgs);
+        return nLength;
+    }
+
+    int nFmtLen = nLength = strlen(pFmt);
+    int nOffset = 0;
+
+    while (nOffset < nFmtLen)
+    {
+        int nPosit = xstrsrc(&pFmt[nOffset], "%");
+        if (nPosit < 0) break;
+
+        nOffset += nPosit + 1;
+        if (nOffset >= nFmtLen) break;
+
+        char sBuff[XSTR_INT_ARG_MAX];
+        uint8_t nBuffPosit = 0;
+
+        while (isdigit(pFmt[nOffset]) &&
+            nOffset < nFmtLen &&
+            nBuffPosit < sizeof(sBuff) - 1)
+                sBuff[nBuffPosit++] = pFmt[nOffset++];
+
+        sBuff[nBuffPosit] = XSTR_NUL;
+        if (nBuffPosit) nLength += atoi(sBuff);
+
+        if (pFmt[nOffset] == '%')
+            if (++nOffset >= nFmtLen) break;
+
+        switch(pFmt[nOffset])
+        {
+            case '%':
+                nLength++;
+                break;
+            case 's':
+            {
+                const char* pArg = va_arg(locArgs,const char*);
+                if (pArg != NULL) nLength += strlen(pArg);
+                break;
+            }
+            case 'f':
+            case 'e':
+            case 'E':
+            case 'g':
+            case 'G':
+                nLength += XSTR_DOUBLE_ARG_MAX;
+                va_arg(locArgs,double);
+                break;
+            case 'd':
+            case 'i':
+            case 'o':
+            case 'u':
+            case 'x':
+            case 'X':
+            case 'c':
+                nLength += XSTR_INT_ARG_MAX;
+                va_arg(locArgs,int);
+                break;
+            default:
+                nLength += XSTR_INT_ARG_MAX;
+                va_arg(locArgs,void*);
+                break;
+        }
+    }
+#endif
+
+    va_end(locArgs);
+    return nLength;
+}
+
+char* xstralloc(size_t nSize)
+{
+    if (!nSize) return NULL;
+    char *pStr = (char*)malloc(nSize);
+    if (pStr != NULL) pStr[0] = XSTR_NUL;
+    return pStr;
+}
+
+/*!
+ * @brief Random lower case letters, upper case too with bUpper, digits too with bNumbers.
+ * @return Number of characters written, at most nSize - 1.
+ * @note Uses rand(): not for secrets, keys or tokens.
+ */
+size_t xstrrand(char *pDst, size_t nSize, size_t nLength, xbool_t bUpper, xbool_t bNumbers)
+{
+    if (pDst == NULL || !nSize || !nLength) return XSTDNON;
+    const char *pChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const char *pNums = "0123456789";
+
+    size_t i, nCharCount = XSTD_MIN(nLength, nSize - 1);
+    int nLimit = bUpper ? XSTR_LETTERS : XSTR_LETTERS / 2;
+
+    for (i = 0; i < nCharCount; i++)
+    {
+        if (bNumbers && rand() % 2)
+        {
+            int nKey = rand() % 10;
+            pDst[i] = pNums[nKey];
+        }
+        else
+        {
+            int nKey = rand() % nLimit;
+            pDst[i] = pChars[nKey];
+        }
+    }
+
+    pDst[nCharCount] = XSTR_NUL;
+    return nCharCount;
+}
+
+/*!
+ * @brief Equality test of the first nCmpLen characters with strncmp() rules, so a prefix test.
+ * @return XTRUE when they are equal, XFALSE when they differ, nCmpLen is 0 or a pointer is NULL.
+ * @note Not strncmp(): XTRUE (1) means equal, xstrncmp("abcdef", "abc", 3) is XTRUE.
+ */
+xbool_t xstrncmp(const char *pStr, const char *pCmp, size_t nCmpLen)
+{
+    XCHECK_NL((pStr && pCmp && nCmpLen), XFALSE);
+    int nDifferent = strncmp(pStr, pCmp, nCmpLen);
+    return nDifferent ? XFALSE : XTRUE;
+}
+
+/*!
+ * @brief Equality test of two strings of the given lengths.
+ * @return XTRUE when nStrLen == nCmpLen and the strings are equal over that length,
+ *         XFALSE otherwise, also for a zero length or NULL.
+ * @note Compares with strncmp(), which stops at a NUL byte: not binary safe.
+ */
+xbool_t xstrncmpn(const char *pStr, size_t nStrLen, const char *pCmp, size_t nCmpLen)
+{
+    XCHECK_NL((pStr && pCmp && nStrLen), XFALSE);
+    XCHECK_NL((nStrLen == nCmpLen), XFALSE);
+    int nDiff = strncmp(pStr, pCmp, nCmpLen);
+    return nDiff ? XFALSE : XTRUE;
+}
+
+/*!
+ * @brief Like xstrncmp(), ignoring the case of ASCII letters.
+ * @return XTRUE when the first nCmpLen characters are equal,
+ *         XFALSE otherwise, also for nCmpLen 0 or NULL.
+ */
+xbool_t xstrncasecmp(const char *pStr, const char *pCmp, size_t nCmpLen)
+{
+    XCHECK_NL((pStr && pCmp && nCmpLen), XFALSE);
+#ifdef _WIN32
+    int nDifferent = _strnicmp(pStr, pCmp, nCmpLen);
+#else
+    int nDifferent = strncasecmp(pStr, pCmp, nCmpLen);
+#endif
+    return nDifferent ? XFALSE : XTRUE;
+}
+
+/*!
+ * @brief Equality test of two C strings, not an ordering like strcmp().
+ * @return XTRUE when the strings are equal, XFALSE when they differ or either is NULL.
+ */
+xbool_t xstrcmp(const char *pStr, const char *pCmp)
+{
+    XCHECK_NL(((pStr != NULL) && (pCmp != NULL)), XFALSE);
+    return strcmp(pStr, pCmp) ? XFALSE : XTRUE;
+}
+
+/*!
+ * @brief Whole string wildcard match: '*' is any run of characters, '?' one character.
+ * @return XTRUE when pStr[0, nLength) matches pPattern[0, nPatternLength), XFALSE otherwise.
+ */
+/*
+    '*' matches any run of characters (none included), '?' exactly one, and
+    every other pattern character itself.
+
+    Matched in one pass that backs up only to the most recent '*'. That is
+    enough: an earlier '*' can never need a different split once a later one
+    has matched. The recursive version took one stack frame per character of
+    the name and, with several '*' in the pattern, time exponential in their
+    number; search patterns come from remote clients, and one pattern like
+    "*a*a*a*a*a*b" over a long name could stall the search for good.
+*/
+xbool_t xstrnmatch(const char *pStr, size_t nLength, const char *pPattern, size_t nPatternLength)
+{
+    XCHECK_NL(((pStr != NULL) && (pPattern != NULL)), XFALSE);
+    if (!nPatternLength) return !nLength ? XTRUE : XFALSE;
+
+    size_t nStr = 0, nPat = 0;
+    size_t nStarPat = SIZE_MAX, nStarStr = 0;
+
+    while (nStr < nLength)
+    {
+        if (nPat < nPatternLength && pPattern[nPat] == '*')
+        {
+            /* Remember where the run started, and first try it empty */
+            nStarPat = nPat++;
+            nStarStr = nStr;
+        }
+        else if (nPat < nPatternLength && (pPattern[nPat] == '?' || pPattern[nPat] == pStr[nStr]))
+        {
+            nStr++;
+            nPat++;
+        }
+        else if (nStarPat != SIZE_MAX)
+        {
+            /* Let the last '*' take one more character and retry after it */
+            nPat = nStarPat + 1;
+            nStr = ++nStarStr;
+        }
+        else return XFALSE;
+    }
+
+    /* The name is used up: only trailing '*' may be left of the pattern */
+    while (nPat < nPatternLength && pPattern[nPat] == '*') nPat++;
+    return nPat == nPatternLength ? XTRUE : XFALSE;
+}
+
+/*!
+ * @brief Wildcard match like xstrnmatch() with a NUL terminated pattern.
+ * @return XTRUE on a match, XFALSE otherwise.
+ * @note An empty string (nLength 0) matches only an empty pattern, not even "*" (xstrnmatch() does).
+ */
+xbool_t xstrmatch(const char *pStr, size_t nLength, const char *pPattern)
+{
+    XCHECK_NL(((pStr != NULL) && (pPattern != NULL)), XFALSE);
+    if (!nLength) return !xstrused(pPattern) ? XTRUE : XFALSE;
+    size_t nPatternLength = strlen(pPattern);
+    return xstrnmatch(pStr, nLength, pPattern, nPatternLength);
+}
+
+/*!
+ * @brief Wildcard match against a list of patterns like "*.c;*.h", pDelimiter NULL means ";".
+ * @return XTRUE when any of the patterns matches, XFALSE otherwise.
+ * @note An empty string matches only an empty list. A list that starts with the delimiter
+ *       is used as one pattern, the delimiter included.
+ */
+xbool_t xstrmatchm(const char *pStr, size_t nLength, const char *pPattern, const char *pDelimiter)
+{
+    XCHECK_NL(((pStr != NULL) && (pPattern != NULL)), XFALSE);
+    if (!nLength) return !xstrused(pPattern) ? XTRUE : XFALSE;
+
+    const char *pDlmt = pDelimiter == NULL ? ";" : pDelimiter;
+    if (!xstrsrc(pPattern, pDlmt)) return xstrmatch(pStr, nLength, pPattern);
+
+    xarray_t *pTokens = xstrsplit(pPattern, pDlmt);
+    size_t i, nUsed = XArray_Used(pTokens);
+    xbool_t bFound = XFALSE;
+
+    for (i = 0; i < nUsed; i++)
+    {
+        xarray_data_t *pArrData = XArray_Get(pTokens, i);
+        if (pArrData == NULL || pArrData->pData == NULL || !pArrData->nSize) continue;
+
+        const char *pToken = (const char *)pArrData->pData;
+        size_t nTokenLength = pArrData->nSize - 1;
+
+        bFound = xstrnmatch(pStr, nLength, pToken, nTokenLength);
+        if (bFound) break;
+    }
+
+    XArray_Destroy(pTokens);
+    return bFound;
+}
+
+/*!
+ * @brief Simple '*' matcher, not a regular expression.
+ * @return XTRUE on a match, XFALSE otherwise.
+ * @note Each literal part matches at its first occurrence only:
+ *       "*a" does not match "xaxa". xstrmatch() matches wildcards properly.
+ */
+xbool_t xstrregex(const char *pStr, size_t nLength, const char *pPattern)
+{
+    XCHECK_NL(((pStr != NULL) && (pPattern != NULL)), XFALSE);
+    xarray_t *pTokens = xstrsplitd(pPattern, "*");
+    size_t nUsed = XArray_Used(pTokens);
+
+    if (!nUsed)
+    {
+        XArray_Destroy(pTokens);
+        return xstrcmp(pStr, pPattern);
+    }
+
+    xbool_t bMatch = XTRUE;
+    size_t i, nOffset = 0;
+
+    for (i = 0; i < nUsed; i++)
+    {
+        const char *pTok = (const char*)XArray_GetData(pTokens, i);
+        if (!xstrused(pTok) || xstrcmp(pTok, "*")) continue;
+
+        if (!i && !xstrncmp(pTok, pStr, strlen(pTok)))
+        {
+            bMatch = XFALSE;
+            break;
+        }
+
+        int nPosit = xstrnsrc(pStr, nLength, pTok, nOffset);
+        if (nPosit < 0) { bMatch = XFALSE; break; }
+
+        nOffset += nPosit;
+        if (nOffset >= nLength) { bMatch = XFALSE; break; }
+
+        const char *pOffset = (const char*)&pStr[nOffset];
+        if (i + 1 == nUsed && !xstrcmp(pTok, pOffset)) { bMatch = XFALSE; break; }
+
+        nOffset += strlen(pTok);
+    }
+
+    XArray_Destroy(pTokens);
+    return bMatch;
+}
+
+size_t xstrnfill(char *pDst, size_t nSize, size_t nLength, char cFill)
+{
+    if (pDst == NULL || !nSize) return XSTDNON;
+
+    size_t i, nFillLength = XSTD_MIN(nLength, nSize - 1);
+    for (i = 0; i < nFillLength; i++) pDst[i] = cFill;
+
+    pDst[nFillLength] = XSTR_NUL;
+    return nFillLength;
+}
+
+/*!
+ * @brief A string of nLength cFill characters, at most XSTR_MAX - 1.
+ * @return A static buffer shared by all calls: not thread safe, overwritten by the next call.
+ */
+char *xstrfill(size_t nLength, char cFill)
+{
+    static char sRetVal[XSTR_MAX];
+    size_t nLen, i = 0;
+    xstrnul(sRetVal);
+
+    nLen = XSTD_MIN(nLength, sizeof(sRetVal) - 1);
+    for (i = 0; i < nLen; i++) sRetVal[i] = cFill;
+
+    sRetVal[i] = '\0';
+    return sRetVal;
+}
+
+/*!
+ * @brief vsnprintf() into pDest.
+ * @return Length written, cut to nSize - 1, or XSTDERR (-1) for a NULL pDest or a zero nSize.
+ */
+int xstrncpyarg(char *pDest, size_t nSize, const char *pFmt, va_list args)
+{
+    if (pDest == NULL || !nSize) return XSTDERR;
+    size_t nLength = 0;
+    xstrnul(pDest);
+
+    int nBytes = vsnprintf(pDest, nSize, pFmt, args);
+    if (nBytes > 0) nLength = XSTD_MIN((size_t)nBytes, nSize - 1);
+
+    pDest[nLength] = XSTR_NUL;
+    return (int)nLength;
+}
+
+/* Formats into a small stack buffer. A positive return below nSize is the whole
+   result; anything else means it has to be measured and formatted again. */
+static int xstrtryargs(char *pDst, size_t nSize, const char *pFmt, va_list args)
+{
+    /* Nothing is formatted without a format, as for an empty one */
+    if (pFmt == NULL) return 0;
+    va_list locArgs;
+#ifdef va_copy
+    va_copy(locArgs, args);
+#else
+    memcpy(&locArgs, &args, sizeof(va_list));
+#endif
+
+    int nBytes = vsnprintf(pDst, nSize, pFmt, locArgs);
+    va_end(locArgs);
+    return nBytes;
+}
+
+/*!
+ * @brief Formats into a new malloc() buffer, the caller frees it; *nDstLength gets its length.
+ * @return The new string, or NULL (*nDstLength 0) on failure and also when the result is empty.
+ */
+char* xstracpyargs(const char *pFmt, va_list args, size_t *nDstLength)
+{
+    if (nDstLength) *nDstLength = 0;
+
+    char sStack[XSTR_MIN];
+    int nBytes = xstrtryargs(sStack, sizeof(sStack), pFmt, args);
+    if (!nBytes) return NULL;
+
+    if (nBytes > 0 && (size_t)nBytes < sizeof(sStack))
+    {
+        char *pDest = (char*)malloc((size_t)nBytes + 1);
+        if (pDest == NULL) return NULL;
+
+        memcpy(pDest, sStack, (size_t)nBytes + 1);
+        if (nDstLength) *nDstLength = (size_t)nBytes;
+        return pDest;
+    }
+
+    size_t nArgLength = xstrarglen(pFmt, args);
+    if (!nArgLength) return NULL;
+
+    if (nArgLength == SIZE_MAX) return NULL;
+    char *pDest = (char*)malloc(++nArgLength);
+    if (pDest == NULL) return NULL;
+
+    int nLength = xstrncpyarg(pDest, nArgLength, pFmt, args);
+    if (nLength <= 0)
+    {
+        free(pDest);
+        return NULL;
+    }
+
+    if (nDstLength) *nDstLength = (size_t)nLength;
+    return pDest;
+}
+
+/*!
+ * @brief Formats into a new pPool buffer (xfree() it); *nDstLength gets its length.
+ * @return The new string, or NULL (*nDstLength 0) on failure and also when the result is empty.
+ */
+char* xstrpcpyargs(xpool_t *pPool, const char *pFmt, va_list args, size_t *nDstLength)
+{
+    if (nDstLength) *nDstLength = 0;
+
+    char sStack[XSTR_MIN];
+    int nBytes = xstrtryargs(sStack, sizeof(sStack), pFmt, args);
+    if (!nBytes) return NULL;
+
+    if (nBytes > 0 && (size_t)nBytes < sizeof(sStack))
+    {
+        char *pDest = (char*)xalloc(pPool, (size_t)nBytes + 1);
+        if (pDest == NULL) return NULL;
+
+        memcpy(pDest, sStack, (size_t)nBytes + 1);
+        if (nDstLength) *nDstLength = (size_t)nBytes;
+        return pDest;
+    }
+
+    size_t nArgLength = xstrarglen(pFmt, args);
+    if (!nArgLength) return NULL;
+
+    if (nArgLength == SIZE_MAX) return NULL;
+    char *pDest = (char*)xalloc(pPool, ++nArgLength);
+    if (pDest == NULL) return NULL;
+
+    int nLength = xstrncpyarg(pDest, nArgLength, pFmt, args);
+    if (nLength <= 0)
+    {
+        xfree(pPool, pDest);
+        return NULL;
+    }
+
+    if (nDstLength) *nDstLength = (size_t)nLength;
+    return pDest;
+}
+
+/*!
+ * @brief Formats into a new malloc() buffer, the caller frees it.
+ * @return The new string, or NULL on failure and also when the result is empty.
+ */
+char* xstracpyarg(const char *pFmt, va_list args)
+{
+    size_t nDummy = 0;
+    return xstracpyargs(pFmt, args, &nDummy);
+}
+
+/*!
+ * @brief Formats into a new malloc() buffer, the caller frees it.
+ * @return The new string, or NULL on failure and also when the result is empty.
+ */
+char* xstracpy(const char *pFmt, ...)
+{
+    char *pDest = NULL;
+    XSTRCPYFMT(pDest, pFmt, NULL);
+    return pDest;
+}
+
+/*!
+ * @brief Formats into a new malloc() buffer, the caller frees it; *nSize gets its length.
+ * @return The new string, or NULL (*nSize 0) on failure and also when the result is empty.
+ */
+char* xstracpyn(size_t *nSize, const char *pFmt, ...)
+{
+    if (nSize) *nSize = 0;
+    char *pDest = NULL;
+    XSTRCPYFMT(pDest, pFmt, nSize);
+    return pDest;
+}
+
+/*!
+ * @brief Formats into a new buffer with vasprintf(), the caller frees it.
+ * @return The new string, or NULL on failure, for an empty result and always without _XUTILS_USE_GNU.
+ */
+char* xstrxcpy(const char *pFmt, ...)
+{
+#ifdef _XUTILS_USE_GNU
+    va_list args;
+    char *pDest = NULL;
+    int nLength = 0;
+    if (pFmt == NULL) return NULL;
+
+    va_start(args, pFmt);
+    nLength = vasprintf(&pDest, pFmt, args);
+    va_end(args);
+
+    if (nLength <= 0 || pDest == NULL)
+    {
+        free(pDest);
+        return NULL;
+    }
+
+    pDest[nLength] = XSTR_NUL;
+    return pDest;
+#endif
+    (void)pFmt;
+    return NULL;
+}
+
+/*!
+ * @brief Formats into a new buffer at *pDst with vasprintf(), the caller frees it.
+ * @return Length of the string, 0 on failure; without _XUTILS_USE_GNU 0 and *pDst is left unset.
+ */
+size_t xstrxcpyf(char **pDst, const char *pFmt, ...)
+{
+#ifdef _XUTILS_USE_GNU
+    va_list args;
+    int nBytes = 0;
+    if (!pDst || !pFmt) return 0;
+
+    va_start(args, pFmt);
+    nBytes = vasprintf(pDst, pFmt, args);
+    va_end(args);
+
+    if (nBytes < 0)
+    {
+        *pDst = NULL;
+        return 0;
+    }
+
+    (*pDst)[nBytes] = XSTR_NUL;
+    return (size_t)nBytes;
+#endif
+    (void)pDst;
+    (void)pFmt;
+    return 0;
+}
+
+/*!
+ * @brief Copies pSrc into pDst, cut to nSize - 1 characters and always NUL terminated.
+ * @return Number of characters copied (not strlen(pSrc) like strlcpy()),
+ *         0 for a NULL or empty pSrc (pDst is emptied) or a NULL / zero sized pDst.
+ */
+size_t xstrncpy(char *pDst, size_t nSize, const char* pSrc)
+{
+    if (pDst == NULL || !nSize) return 0;
+    pDst[0] = XSTR_NUL;
+    if (!xstrused(pSrc)) return 0;
+
+    size_t nCopySize = strnlen(pSrc, nSize - 1);
+    if (nCopySize) memcpy(pDst, pSrc, nCopySize);
+    pDst[nCopySize] = XSTR_NUL;
+
+    return nCopySize;
+}
+
+size_t xstrncpys(char *pDst, size_t nDstSize, const char *pSrc, size_t nSrcLen)
+{
+    if (pDst == NULL || !nDstSize) return 0;
+    size_t nCopySize = pSrc != NULL ? XSTD_MIN(nSrcLen, nDstSize - 1) : 0;
+    if (nCopySize) memmove(pDst, pSrc, nCopySize);
+    pDst[nCopySize] = XSTR_NUL;
+    return nCopySize;
+}
+
+/*!
+ * @brief snprintf() into pDst.
+ * @return Length written, cut to nSize - 1 (not the full length like snprintf(),
+ *         so a cut can not be told from it), or (size_t)-1 for a NULL pDst or a zero nSize.
+ */
+size_t xstrncpyf(char *pDst, size_t nSize, const char *pFmt, ...)
+{
+    int nBytes = 0;
+    va_list args;
+    va_start(args, pFmt);
+    nBytes = xstrncpyarg(pDst, nSize, pFmt, args);
+    va_end(args);
+    return nBytes;
+}
+
+/*!
+ * @brief Formats into pDst and pads it on the right with cFChar up to nFLen characters.
+ * @return Length of the result.
+ */
+size_t xstrncpyfl(char *pDst, size_t nSize, size_t nFLen, char cFChar, const char* pFmt, ...)
+{
+    if (pDst == NULL || !nSize) return 0;
+    if (nFLen > nSize) nFLen = nSize - 1;
+
+    size_t nBytes = 0;
+    va_list args;
+
+    va_start(args, pFmt);
+    nBytes = xstrncpyarg(pDst, nSize, pFmt, args);
+    va_end(args);
+
+    /* The formatted text already fills the field. Subtracting it from the
+       field length would wrap and pad out the whole destination buffer. */
+    if (nBytes >= nFLen) return nBytes;
+
+    nBytes += xstrnfill(&pDst[nBytes], nSize - nBytes, nFLen - nBytes, cFChar);
+    return nBytes;
+}
+
+/*!
+ * @brief Formats into pDst and pads it on the left with cFChar up to nFLen characters.
+ * @return Length of the result.
+ */
+size_t xstrnlcpyf(char *pDst, size_t nSize, size_t nFLen, char cFChar, const char* pFmt, ...)
+{
+    if (pDst == NULL || !nSize) return 0;
+    if (nFLen > nSize) nFLen = nSize - 1;
+
+    xstrnul(pDst);
+    size_t nBytes = 0;
+    va_list args;
+
+    va_start(args, pFmt);
+    nBytes = xstrarglen(pFmt, args);
+
+    if (!nBytes)
+    {
+        va_end(args);
+        return nBytes;
+    }
+    else if (nBytes >= nFLen)
+    {
+        nBytes = xstrncpyarg(pDst, nSize, pFmt, args);
+        va_end(args);
+        return nBytes;
+    }
+
+    pDst[0] = XSTR_NUL;
+    nFLen -= nBytes;
+    nBytes = 0;
+
+    nBytes += xstrnfill(pDst, nSize, nFLen, cFChar);
+    nBytes = xstrncpyarg(&pDst[nBytes], nSize - nBytes, pFmt, args);
+
+    va_end(args);
+    return nBytes + nFLen;
+}
+
+size_t xstrnrgb(char *pStr, size_t nSize, int nR, int nG, int nB)
+{
+    if (pStr == NULL || !nSize) return 0;
+    return xstrncpyf(pStr, nSize, "\x1B[38;2;%d;%d;%dm", nR, nG, nB);
+}
+
+size_t xstrnyuv(char *pStr, size_t nSize, int nY, int nU, int nV)
+{
+    int nR = (int)(nY + 1.4075 * (nV - 128));
+    int nG = (int)(nY - 0.3455 * (nU - 128) - 0.7169 * (nV - 128));
+    int nB = (int)(nY + 1.7790 * (nU - 128));
+
+    nR = nR < 0 ? 0 : XSTD_MIN(nR, 255);
+    nG = nG < 0 ? 0 : XSTD_MIN(nG, 255);
+    nB = nB < 0 ? 0 : XSTD_MIN(nB, 255);
+
+    return xstrnrgb(pStr, nSize, nR, nG, nB);
+}
+
+char *xstrrgb(int nR, int nG, int nB)
+{
+    char *sRetVal = (char*)malloc(XSTR_MICRO);
+    size_t nLen = xstrnrgb(sRetVal, XSTR_MICRO, nR, nG, nB);
+    if (nLen) return sRetVal;
+    free(sRetVal);
+    return NULL;
+}
+
+char *xstryuv(int nY, int nU, int nV)
+{
+    char *sRetVal = (char*)malloc(XSTR_MICRO);
+    size_t nLen = xstrnyuv(sRetVal, XSTR_MICRO, nY, nU, nV);
+    if (nLen) return sRetVal;
+    free(sRetVal);
+    return NULL;
+}
+
+/*!
+ * @brief Number of bytes at pOffset that take no screen column.
+ * @return Length of a known color or format escape sequence, 1 for the first byte of
+ *         the degree sign (its second byte is the visible character), 0 otherwise.
+ */
+size_t xstrisextra(const char *pOffset)
+{
+    if (pOffset == NULL) return 0;
+    if (!strncmp(pOffset, XSTR_CLR_LIGHT_MAGENTA, 7) ||
+        !strncmp(pOffset, XSTR_CLR_LIGHT_YELLOW, 7) ||
+        !strncmp(pOffset, XSTR_CLR_LIGHT_WHITE, 7) ||
+        !strncmp(pOffset, XSTR_CLR_LIGHT_GREEN, 7) ||
+        !strncmp(pOffset, XSTR_CLR_LIGHT_CYAN, 7) ||
+        !strncmp(pOffset, XSTR_CLR_LIGHT_BLUE, 7) ||
+        !strncmp(pOffset, XSTR_CLR_LIGHT_RED, 7)) return 7;
+
+    if (!strncmp(pOffset, XSTR_CLR_MAGENTA, 5) ||
+        !strncmp(pOffset, XSTR_CLR_YELLOW, 5) ||
+        !strncmp(pOffset, XSTR_CLR_WHITE, 5) ||
+        !strncmp(pOffset, XSTR_CLR_GREEN, 5) ||
+        !strncmp(pOffset, XSTR_CLR_CYAN, 5) ||
+        !strncmp(pOffset, XSTR_CLR_BLUE, 5) ||
+        !strncmp(pOffset, XSTR_CLR_RED, 5)) return 5;
+
+    if (!strncmp(pOffset, XSTR_BACK_MAGENTA, 5) ||
+        !strncmp(pOffset, XSTR_BACK_YELLOW, 5) ||
+        !strncmp(pOffset, XSTR_BACK_WHITE, 5) ||
+        !strncmp(pOffset, XSTR_BACK_GREEN, 5) ||
+        !strncmp(pOffset, XSTR_BACK_BLACK, 5) ||
+        !strncmp(pOffset, XSTR_BACK_CYAN, 5) ||
+        !strncmp(pOffset, XSTR_BACK_BLUE, 5) ||
+        !strncmp(pOffset, XSTR_BACK_RED, 5)) return 5;
+
+    if (!strncmp(pOffset, XSTR_FMT_HIGHLITE, 4) ||
+        !strncmp(pOffset, XSTR_FMT_ITALIC, 4) ||
+        !strncmp(pOffset, XSTR_FMT_ULINE, 4) ||
+        !strncmp(pOffset, XSTR_FMT_FLICK, 4) ||
+        !strncmp(pOffset, XSTR_FMT_BLINK, 4) ||
+        !strncmp(pOffset, XSTR_FMT_CROSS, 4) ||
+        !strncmp(pOffset, XSTR_FMT_RESET, 4) ||
+        !strncmp(pOffset, XSTR_FMT_BOLD, 4) ||
+        !strncmp(pOffset, XSTR_FMT_HIDE, 4) ||
+        !strncmp(pOffset, XSTR_FMT_DIM, 4)) return 4;
+
+    if (!strncmp(pOffset, XSTR_DEGREE_SYMBOL, 2)) return 1;
+
+    return 0;
+}
+
+/*!
+ * @brief Counts the bytes of escape sequences in pStr that take no screen column.
+ * @return Number of those bytes. *pChars gets the visible characters, *pPosit where the scan stopped:
+ *         the end, or the byte after nMaxChars visible characters when nMaxChars is not 0.
+ */
+size_t xstrextra(const char *pStr, size_t nLength, size_t nMaxChars, size_t *pChars, size_t *pPosit)
+{
+    if (pStr == NULL || !nLength) return XSTDNON;
+    size_t nPosit, nChars = 0, nExtra = 0;
+
+    for (nPosit = 0; nPosit < nLength; nPosit++)
+    {
+        if (nMaxChars && nChars >= nMaxChars) break;
+        const char *pOffset = &pStr[nPosit];
+
+        if (*pOffset == '\x1B' || *pOffset == '\xC2')
+        {
+            size_t nFound = xstrisextra(pOffset);
+            if (nFound)
+            {
+                nPosit += nFound - 1;
+                nExtra += nFound;
+                continue;
+            }
+        }
+
+        nChars++;
+    }
+
+    /* The position is where scanning stopped: the first byte past the
+       character limit, or the end of the string when it fits. Reporting it
+       from inside the loop left it one byte short of a string that fits. */
+    if (pPosit != NULL) *pPosit = nPosit;
+    if (pChars != NULL) *pChars = nChars;
+    return nExtra;
+}
+
+/*!
+ * @brief Appends formatted text after the string in pDst, a buffer of nSize bytes.
+ * @return Number of characters appended, not the new length of pDst.
+ */
+size_t xstrncat(char *pDst, size_t nSize, const char *pFmt, ...)
+{
+    if (pDst == NULL || !nSize) return 0;
+    size_t nUsed = strnlen(pDst, nSize - 1);
+    if (nSize <= nUsed) return 0;
+
+    size_t nAvail = nSize - nUsed;
+    char *pBuffer = &pDst[nUsed];
+    int nLength = 0;
+
+    va_list args;
+    va_start(args, pFmt);
+    nLength = xstrncpyarg(pBuffer, nAvail, pFmt, args);
+    va_end(args);
+
+    return nLength;
+}
+
+/*!
+ * @brief Appends formatted text after the string in pDst, nAvail being the space left in it.
+ * @return The space left after appending, to pass to the next call; not a length.
+ */
+size_t xstrncatf(char *pDst, size_t nAvail, const char *pFmt, ...)
+{
+    if (pDst == NULL || !nAvail) return 0;
+    size_t nUsed = strlen(pDst);
+    char *pBuffer = &pDst[nUsed];
+
+    va_list args;
+    va_start(args, pFmt);
+    int nLength = xstrncpyarg(pBuffer, nAvail, pFmt, args);
+    va_end(args);
+
+    return nAvail - nLength;
+}
+
+/*!
+ * @brief Appends formatted text at pDst + (nSize - nAvail), not at strlen(pDst).
+ * @return The space left after appending, to pass to the next call; not a length.
+ */
+size_t xstrncatsf(char *pDst, size_t nSize, size_t nAvail, const char *pFmt, ...)
+{
+    if (pDst == NULL || !nSize || !nAvail) return 0;
+    size_t nUsed = nSize - nAvail;
+    char *pBuffer = &pDst[nUsed];
+
+    va_list args;
+    va_start(args, pFmt);
+    int nLength = xstrncpyarg(pBuffer, nAvail, pFmt, args);
+    va_end(args);
+
+    return nAvail - nLength;
+}
+
+size_t xstrnclr(char *pDst, size_t nSize, const char* pClr, const char* pStr, ...)
+{
+    if (pDst == NULL || !nSize) return 0;
+    char sBuffer[XSTR_STACK];
+    char *pBuffer = &sBuffer[0];
+
+    uint8_t nAlloc = 0;
+    xstrnul(pDst);
+
+    if (nSize > XSTR_STACK)
+    {
+        pBuffer = (char*)malloc(nSize);
+        if (pBuffer == NULL) return 0;
+        nAlloc = 1;
+    }
+
+    va_list args;
+    va_start(args, pStr);
+    xstrncpyarg(pBuffer, nSize, pStr, args);
+    va_end(args);
+
+    size_t nLength = xstrncpyf(pDst, nSize, "%s%s%s",
+        pClr, pBuffer, XSTR_FMT_RESET);
+
+    if (nAlloc) free(pBuffer);
+    return nLength;
+}
+
+size_t xstrcase(char *pSrc, xstr_case_t eCase)
+{
+    if (!xstrused(pSrc)) return 0;
+    size_t i, nCopyLength = strlen(pSrc);
+    if (!nCopyLength) return 0;
+
+    for (i = 0; i < nCopyLength; i++)
+    {
+        switch (eCase)
+        {
+            case XSTR_LOWER:
+                pSrc[i] = (char)tolower(pSrc[i]);
+                break;
+            case XSTR_UPPER:
+                pSrc[i] = (char)toupper(pSrc[i]);
+                break;
+            default:
+                return 0;
+        }
+    }
+
+    pSrc[nCopyLength] = 0;
+    return nCopyLength;
+}
+
+size_t xstrncases(char* pDst, size_t nSize, xstr_case_t eCase, const char *pSrc, size_t nSrcLen)
+{
+    if (pDst == NULL || pSrc == NULL || !nSize) return 0;
+    size_t i, nCopyLength = XSTD_MIN(nSrcLen, nSize - 1);
+
+    for (i = 0; i < nCopyLength; i++)
+    {
+        switch (eCase)
+        {
+            case XSTR_LOWER:
+                pDst[i] = (char)tolower(pSrc[i]);
+                break;
+            case XSTR_UPPER:
+                pDst[i] = (char)toupper(pSrc[i]);
+                break;
+            default:
+                pDst[i] = pSrc[i];
+                break;
+        }
+    }
+
+    pDst[nCopyLength] = 0;
+    return nCopyLength;
+}
+
+size_t xstrncase(char* pDst, size_t nSize, xstr_case_t eCase, const char *pSrc)
+{
+    if (pDst == NULL || pSrc == NULL || !nSize) return 0;
+    size_t nCopyLength = strnlen(pSrc, nSize - 1);
+    return xstrncases(pDst, nSize, eCase, pSrc, nCopyLength);
+}
+
+/*!
+ * @brief A new malloc() copy of pSrc in the given case, the caller frees it.
+ * @return The copy, or NULL for an empty pSrc or on failure.
+ * @note pSrc must not be NULL.
+ */
+char* xstracase(const char *pSrc, xstr_case_t eCase)
+{
+    if (pSrc == NULL) return NULL;
+    size_t nCopyLength = strlen(pSrc);
+    if (!nCopyLength) return NULL;
+
+    size_t nDstSize = nCopyLength + 1;
+    char *pDst = (char*)malloc(nDstSize);
+    if (pDst == NULL) return NULL;
+
+    xstrncases(pDst, nDstSize, eCase, pSrc, nCopyLength);
+    return pDst;
+}
+
+/*!
+ * @brief A new malloc() copy of at most nLength characters of pSrc in the given case.
+ * @return The copy, or NULL for an empty pSrc or on failure.
+ * @note pSrc must not be NULL.
+ */
+char* xstracasen(const char *pSrc, xstr_case_t eCase, size_t nLength)
+{
+    if (pSrc == NULL) return NULL;
+    size_t nCopyLength = strnlen(pSrc, nLength);
+    if (!nCopyLength) return NULL;
+
+    size_t nDstSize = nCopyLength + 1;
+    char *pDst = (char*)malloc(nDstSize);
+    if (pDst == NULL) return NULL;
+
+    xstrncases(pDst, nDstSize, eCase, pSrc, nCopyLength);
+    return pDst;
+}
+
+/*!
+ * @brief Position of the first occurrence of pSrc in pStr.
+ * @return Index of the match, 0 included, or XSTDERR (-1) when not found or a string is NULL or empty.
+ * @note 0 is a match at the start: test the result with >= 0, never as a boolean.
+ */
+int xstrsrc(const char *pStr, const char *pSrc)
+{
+    if (!xstrused(pStr) || !xstrused(pSrc)) return XSTDERR;
+    const char *pEndPosition = strstr(pStr, pSrc);
+    if (pEndPosition == NULL) return XSTDERR;
+    return (int)(pEndPosition - pStr);
+}
+
+/*!
+ * @brief Binary safe search for pSrc in the first nLen bytes of pStr, starting at nPos.
+ * @return Offset of the match from nPos (not from the start of pStr), or XSTDERR (-1)
+ *         when not found or nPos >= nLen. An empty pSrc matches at offset 0.
+ */
+int xstrnsrc(const char *pStr, size_t nLen, const char *pSrc, size_t nPos)
+{
+    if (pStr == NULL || pSrc == NULL ||
+        nPos >= nLen) return XSTDERR;
+
+    size_t nSearch = strlen(pSrc);
+    if (nSearch > nLen - nPos) return XSTDERR;
+
+    for (size_t i = nPos; i <= nLen - nSearch; i++)
+    {
+        if (memcmp(pStr + i, pSrc, nSearch) == 0)
+            return (int)(i - nPos);
+    }
+
+    return XSTDERR;
+}
+
+/*!
+ * @brief Binary safe search for pSrc in the first nLength bytes of pStr.
+ * @return Index of the match from the start of pStr, or XSTDERR (-1) when not found.
+ * @note pSrc must not be NULL. An empty pSrc gives 0 on GNU builds and XSTDERR elsewhere.
+ */
+int xstrsrcb(const char *pStr, size_t nLength, const char *pSrc)
+{
+    int nPosit = XSTDERR;
+    if (pStr == NULL || pSrc == NULL) return nPosit;
+
+#if !defined(_WIN32) && defined(_GNU_SOURCE)
+    size_t pSearchLen = strlen(pSrc);
+    void *pOffset = memmem(pStr, nLength, pSrc, pSearchLen);
+    if (pOffset != NULL) nPosit = (int)((char*)pOffset - pStr);
+#else
+    if (xstrused(pSrc)) nPosit = xstrnsrc(pStr, nLength, pSrc, 0);
+#endif
+
+    return nPosit;
+}
+
+/*!
+ * @brief Search for pSrc in pStr starting at nPos.
+ * @return Offset of the match from nPos (not from the start of pStr), or XSTDERR (-1).
+ */
+int xstrsrcp(const char *pStr, const char *pSrc, size_t nPos)
+{
+    if (pStr == NULL || pSrc == NULL) return XSTDERR;
+    return xstrnsrc(pStr, strlen(pStr), pSrc, nPos);
+}
+
+int xstrntokn(char *pDst, size_t nSize, const char *pStr, size_t nLen, size_t nPosit, const char *pDlmt)
+{
+    if (pDst != NULL && nSize) pDst[0] = XSTR_NUL;
+    if (pStr == NULL || nPosit >= nLen) return XSTDERR;
+    size_t nDlmtLen = xstrused(pDlmt) ? strlen(pDlmt) : 0;
+
+    int nOffset = xstrsrc(&pStr[nPosit], pDlmt);
+    if (nOffset < 0)
+    {
+        xstrncpy(pDst, nSize, &pStr[nPosit]);
+        return 0;
+    }
+    else if (!nOffset)
+    {
+        if (pDst != NULL && nSize) pDst[0] = '\0';
+        return (int)(nPosit + nDlmtLen);
+    }
+
+    xstrncpys(pDst, nSize, &pStr[nPosit], nOffset);
+    return (int)(nPosit + nOffset + nDlmtLen);
+}
+
+/*!
+ * @brief Copies the token from nPosit up to the delimiter string pDlmt into pDst.
+ * @return Position where the next token starts; 0 when no delimiter follows,
+ *         pDst then holds the last token; XSTDERR (-1) when nPosit is at or past the end of pStr.
+ * @note A loop on `xstrntok(...) > 0` misses the last token: use the token on 0 as well.
+ */
+int xstrntok(char *pDst, size_t nSize, const char *pStr, size_t nPosit, const char *pDlmt)
+{
+    if (pDst != NULL && nSize) pDst[0] = XSTR_NUL;
+    if (pStr == NULL || nPosit >= strlen(pStr)) return XSTDERR;
+    size_t nDlmtLen = xstrused(pDlmt) ? strlen(pDlmt) : 0;
+
+    int nOffset = xstrsrc(&pStr[nPosit], pDlmt);
+    if (nOffset < 0)
+    {
+        xstrncpy(pDst, nSize, &pStr[nPosit]);
+        return 0;
+    }
+    else if (!nOffset)
+    {
+        if (pDst != NULL && nSize) pDst[0] = '\0';
+        return (int)(nPosit + nDlmtLen);
+    }
+
+    xstrncpys(pDst, nSize, &pStr[nPosit], nOffset);
+    return (int)(nPosit + nOffset + nDlmtLen);
+}
+
+/*!
+ * @brief Copies the text between the strings pStart and pEnd of pSrc into pDst.
+ * @return Length copied, 0 when pStart is not found and also for an empty text.
+ *         A NULL pStart cuts from the beginning, a missing pEnd to the end.
+ * @note pDst must not be NULL.
+ */
+size_t xstrncuts(char *pDst, size_t nSize, const char *pSrc, const char *pStart, const char *pEnd)
+{
+    /* A buffer of no size had its first byte written, and then strnlen() was told it had SIZE_MAX */
+    if (pDst == NULL || !nSize) return XSTDNON;
+    pDst[0] = XSTR_NUL;
+    if (pSrc == NULL) return XSTDNON;
+    if (pStart == NULL)
+    {
+        if (pEnd == NULL) return XSTDNON;
+        int nStatus = xstrntok(pDst, nSize, pSrc, 0, pEnd);
+        return (nStatus >= 0) ? strnlen(pDst, nSize - 1) : XSTDNON;
+    }
+
+    int nPosit = xstrsrc(pSrc, pStart);
+    if (nPosit < 0) return XSTDNON;
+    nPosit += (int)strlen(pStart);
+
+    int nStatus = xstrntok(pDst, nSize, pSrc, nPosit, pEnd);
+    return (nStatus >= 0) ? strnlen(pDst, nSize - 1) : XSTDNON;
+}
+
+/*!
+ * @brief Cuts the text after pStart (a string) up to the end mark pEnd in place.
+ * @return Pointer into pData, or NULL when pStart is not found. A NULL pEnd gives
+ *         the rest after pStart, a NULL pStart the first token of pData.
+ * @note Modifies pData: strtok_r() puts a NUL at the end mark. pEnd is a
+ *       set of characters, not a string: "</a>" ends at the first '<', '/', 'a' or '>'.
+ */
+char* xstrcut(char *pData, const char *pStart, const char *pEnd)
+{
+    if (pStart == NULL)
+    {
+        if (pEnd == NULL) return NULL;
+        char *pSavePtr = NULL;
+        return xstrtok(pData, pEnd, &pSavePtr);
+    }
+
+    char *pLine = strstr(pData, pStart);
+    if (pLine != NULL)
+    {
+        pLine += strlen(pStart);
+        if (pEnd == NULL) return pLine;
+        return xstrcut(pLine, NULL, pEnd);
+    }
+
+    return NULL;
+}
+
+/*!
+ * @brief Copies nSize characters of pSrc from nPosit into pDst.
+ * @return The smallest of nSize, nDstSize and the characters left after nPosit: one more than the
+ *         characters copied when the copy is cut to nDstSize - 1. 0 when nPosit is past the end.
+ */
+size_t xstrncut(char *pDst, size_t nDstSize, const char *pSrc, size_t nPosit, size_t nSize)
+{
+    if (pSrc == NULL || !nDstSize || !nSize) return 0;
+    size_t nDataLen = strlen(pSrc);
+    if (!nDataLen || nPosit >= nDataLen) return 0;
+
+    size_t nCopySize = XSTD_MIN(nSize, nDstSize);
+    size_t nPartSize = nDataLen - nPosit;
+
+    nCopySize = XSTD_MIN(nCopySize, nPartSize);
+    xstrncpys(pDst, nDstSize, &pSrc[nPosit], nCopySize);
+    return nCopySize;
+}
+
+char* xstracut(const char *pSrc, size_t nPosit, size_t nSize)
+{
+    if (pSrc == NULL || !nSize) return NULL;
+    size_t nDataLen = strlen(pSrc);
+    if (!nDataLen || nPosit >= nDataLen) return NULL;
+
+    char *pDst = (char*)malloc(nSize + 1);
+    if (pDst == NULL) return NULL;
+
+    size_t nPartSize = nDataLen - nPosit;
+    size_t nCopySize = XSTD_MIN(nSize, nPartSize);
+    xstrncpys(pDst, nSize + 1, &pSrc[nPosit], nCopySize);
+    return pDst;
+}
+
+/*!
+ * @brief Removes nSize characters of pStr at nPosit, in place.
+ * @return New length of pStr, or 0 when nothing was removed and pStr is left as it was.
+ * @note 0 is also the new length when everything was removed: compare it with the old length.
+ */
+size_t xstrnrm(char *pStr, size_t nPosit, size_t nSize)
+{
+    if (pStr == NULL || !nSize) return 0;
+    int nStrLen = (int)strlen(pStr);
+
+    if (nStrLen <= 0 || nPosit >= (size_t)nStrLen) return 0;
+    nSize = ((nPosit + nSize) > (size_t)nStrLen) ? nStrLen - nPosit : nSize;
+
+    size_t nTailOffset = nPosit + nSize;
+    if (nTailOffset >= (size_t)nStrLen)
+    {
+        nStrLen = (int)nPosit;
+        pStr[nStrLen] = XSTR_NUL;
+        return nStrLen;
+    }
+
+    size_t nTailSize = nStrLen - nTailOffset;
+    const char *pTail = &pStr[nTailOffset];
+    memmove(&pStr[nPosit], pTail, nTailSize);
+
+    nStrLen -= (int)nSize;
+    pStr[nStrLen] = XSTR_NUL;
+    return nStrLen;
+}
+
+/*!
+ * @brief Replaces every pRep of pOrig with pWith into a new malloc() buffer to free.
+ * @return The new string, or NULL for a NULL argument or on failure. An empty pRep replaces nothing.
+ */
+char *xstrrep(const char *pOrig, const char *pRep, const char *pWith)
+{
+    XCHECK_NL((pOrig && pRep && pWith), NULL);
+    size_t nOrigLen = strlen(pOrig);
+    size_t nWithLen = strlen(pWith);
+    size_t nRepLen = strlen(pRep);
+    int nNext = 0, nCount = 0;
+
+    while ((nNext = xstrntokn(NULL, 0, pOrig, nOrigLen, nNext, pRep)) > 0) nCount++;
+    size_t nSpaceAvail = ((nWithLen - nRepLen) * nCount) + nOrigLen + 1;
+
+    char *pResult = (char*)malloc(nSpaceAvail);
+    XCHECK(pResult, NULL);
+    char *pOffset = pResult;
+
+    while (nCount--)
+    {
+        int nFirstPartLen = xstrsrc(pOrig, pRep);
+        if (nFirstPartLen < 0) break;
+
+        if (nFirstPartLen)
+        {
+            xstrncpys(pOffset, nSpaceAvail, pOrig, nFirstPartLen);
+            nSpaceAvail -= nFirstPartLen;
+            pOffset += nFirstPartLen;
+        }
+
+        xstrncpys(pOffset, nSpaceAvail, pWith, nWithLen);
+        nSpaceAvail -= nWithLen;
+        pOffset += nWithLen;
+        pOrig += nFirstPartLen + nRepLen;
+    }
+
+    xstrncpyf(pOffset, nSpaceAvail, "%s", pOrig);
+    return pResult;
+}
+
+/*!
+ * @brief Replaces every pRep of pOrig with pWith into pDst.
+ * @return XSTDOK when the whole result fit, XSTDNON (0) when it did not
+ *         (pDst holds a cut result), XSTDINV for a NULL argument.
+ */
+int xstrnrep(char *pDst, size_t nSize, const char *pOrig, const char *pRep, const char *pWith)
+{
+    XCHECK(pDst, XSTDINV);
+    XCHECK_NL((pOrig && pRep && pWith), XSTDINV);
+    char *pOffset = pDst;
+
+    size_t nOrigLen = strlen(pOrig);
+    size_t nWithLen = strlen(pWith);
+    size_t nRepLen = strlen(pRep);
+
+    int nAvail = (int)nSize;
+    int nNext = 0, nCount = 0;
+
+    while ((nNext = xstrntokn(NULL, 0, pOrig, nOrigLen, nNext, pRep)) > 0) nCount++;
+
+    while (nCount--)
+    {
+        int nFirstPartLen = xstrsrc(pOrig, pRep);
+        if (nFirstPartLen < 0) break;
+
+        if (nFirstPartLen)
+        {
+            xstrncpys(pOffset, nAvail, pOrig, nFirstPartLen);
+            pOffset += nFirstPartLen;
+            nAvail -= nFirstPartLen;
+            if (nAvail <= 0) return XSTDNON;
+        }
+
+        xstrncpys(pOffset, nAvail, pWith, nWithLen);
+        pOrig += (size_t)nFirstPartLen + nRepLen;
+        nAvail -= (int)nWithLen;
+        pOffset += (int)nWithLen;
+        if (nAvail <= 0) return XSTDNON;
+    }
+
+    xstrncpyf(pOffset, nAvail, "%s", pOrig);
+    return XSTDOK;
+}
+
+char *xstrdup(const char *pStr)
+{
+    if (pStr == NULL) return NULL;
+    size_t nLength = strlen(pStr);
+
+    char *pDst = (char*)malloc(++nLength);
+    if (pDst == NULL) return NULL;
+
+    xstrncpy(pDst, nLength, pStr);
+    return pDst;
+}
+
+char *xstrpdup(xpool_t *pPool, const char *pStr)
+{
+    if (pStr == NULL) return NULL;
+    size_t nLength = strlen(pStr);
+
+    char *pDst = (char*)xalloc(pPool, ++nLength);
+    if (pDst == NULL) return NULL;
+
+    xstrncpy(pDst, nLength, pStr);
+    return pDst;
+}
+
+/*!
+ * @brief Checks that a string has content.
+ * @return XTRUE when pStr is not NULL and not empty, XFALSE otherwise.
+ */
+xbool_t xstrused(const char *pStr)
+{
+    if (pStr == NULL) return XFALSE;
+    return (pStr[0] != XSTR_NUL) ? XTRUE : XFALSE;
+}
+
+/*!
+ * @brief Sets nLength bytes of pString to NUL.
+ * @note A zero nLength still writes one NUL byte. pString must not be NULL.
+ */
+void xstrnull(char *pString, size_t nLength)
+{
+    if (pString == NULL) return;
+    if (!nLength) *pString = 0;
+    else while (nLength--) *pString++ = 0;
+}
+
+void xstrnul(char *pString)
+{
+    if (pString == NULL) return;
+    pString[0] = XSTR_NUL;
+}
+
+/*!
+ * @brief Binary safe xstrntok() over nLen bytes with a delimiter of nDlmtLen bytes.
+ * @return Next position, 0 for the last token, XSTDERR (-1) past the end, as xstrntok().
+ */
+int xstrntokat(char *pDst, size_t nSize, const char *pStr, size_t nLen, size_t nPosit, const char *pDlmt, size_t nDlmtLen)
+{
+    if (pDst != NULL && nSize) pDst[0] = XSTR_NUL;
+    if (pStr == NULL || nPosit >= nLen) return XSTDERR;
+
+    const char *pStart = pStr + nPosit;
+    const char *pCursor = pStart;
+    const char *pFound = NULL;
+    size_t nLeft = nLen - nPosit;
+
+    /* No delimiter is never found, the rest is the last token. Searched for, an
+       empty one had memchr() look one byte past the end for its first byte. */
+    while (pDlmt != NULL && nDlmtLen && nLeft >= nDlmtLen)
+    {
+        const char *pHit = (const char*)memchr(pCursor, pDlmt[0], nLeft - nDlmtLen + 1);
+        if (pHit == NULL) break;
+
+        if (!memcmp(pHit, pDlmt, nDlmtLen))
+        {
+            pFound = pHit;
+            break;
+        }
+
+        nLeft -= (size_t)(pHit - pCursor) + 1;
+        pCursor = pHit + 1;
+    }
+
+    if (pFound == NULL)
+    {
+        xstrncpys(pDst, nSize, pStart, nLen - nPosit);
+        return 0;
+    }
+
+    size_t nOffset = (size_t)(pFound - pStart);
+    if (!nOffset) return (int)(nPosit + nDlmtLen);
+
+    xstrncpys(pDst, nSize, pStart, nOffset);
+    return (int)(nPosit + nOffset + nDlmtLen);
+}
+
+static size_t xstrsplitrollback(xarray_t *pTokens, size_t nUsed)
+{
+    while (pTokens->nUsed > nUsed)
+    {
+        xarray_data_t *pToken = XArray_Remove(pTokens, pTokens->nUsed - 1);
+        XArray_ClearData(pTokens, pToken);
+    }
+    pTokens->eStatus = XARRAY_STATUS_NO_MEMORY;
+    return XSTDNON;
+}
+
+/*!
+ * @brief Splits pString at the delimiter string pDlmt and appends the tokens to pTokens.
+ * @return Number of entries pTokens has now, the ones it had before included, not the number added;
+ *         0 for invalid arguments or on failure (the added tokens are removed again).
+ */
+size_t xstrsplita(const char *pString, const char *pDlmt, xarray_t *pTokens, xbool_t bIncludeDlmt, xbool_t bIncludeEmpty)
+{
+    if (!xstrused(pString) || !xstrused(pDlmt) || pTokens == NULL) return XSTDNON;
+
+    char sDelimiter[XSTR_MID];
+    char sToken[XSTR_MAX];
+
+    size_t nUsed = pTokens->nUsed;
+    size_t nStrLength = strlen(pString);
+    size_t nSearchLength = strlen(pDlmt);
+    int nDlmtLen = 0;
+    int nNext = 0;
+
+    if (bIncludeDlmt)
+    {
+        nDlmtLen = (int)xstrncpy(sDelimiter, sizeof(sDelimiter), pDlmt);
+        if (xstrncmp(pString, sDelimiter, nDlmtLen) &&
+            XArray_AddData(pTokens, sDelimiter, nDlmtLen + 1) < 0)
+            return xstrsplitrollback(pTokens, nUsed);
+    }
+
+    while((nNext = xstrntokat(sToken, sizeof(sToken), pString, nStrLength, (size_t)nNext, pDlmt, nSearchLength)) >= 0)
+    {
+        size_t nLength = strlen(sToken);
+        if (!nLength)
+        {
+            if (bIncludeEmpty && XArray_AddData(pTokens, XSTR_EMPTY, sizeof(char)) < 0)
+                return xstrsplitrollback(pTokens, nUsed);
+
+            continue;
+        }
+
+        if (XArray_AddData(pTokens, sToken, nLength + 1) < 0)
+            return xstrsplitrollback(pTokens, nUsed);
+
+        if (nNext <= 0) break;
+        int nOffset = nNext - nDlmtLen;
+
+        if (bIncludeDlmt && nOffset >= 0)
+        {
+            if (xstrncmp(&pString[nOffset], sDelimiter, nDlmtLen) &&
+                XArray_AddData(pTokens, sDelimiter, nDlmtLen + 1) < 0)
+                return xstrsplitrollback(pTokens, nUsed);
+        }
+    }
+
+    return pTokens->nUsed;
+}
+
+/*!
+ * @brief Splits pString at the delimiter string pDlmt into a new array, skipping empty tokens.
+ * @return The array (XArray_Destroy() frees it), or NULL when there is no token at all.
+ */
+xarray_t* xstrsplit(const char *pString, const char *pDlmt)
+{
+    if (!xstrused(pString) || !xstrused(pDlmt)) return NULL;
+
+    xarray_t *pArray = XArray_NewPool(XSTDNON, XSTDNON, XFALSE);
+    if (pArray == NULL) return NULL;
+
+    xstrsplita(pString, pDlmt, pArray, XFALSE, XFALSE);
+    if (pArray->nUsed) return pArray;
+
+    XArray_Destroy(pArray);
+    return NULL;
+}
+
+/*!
+ * @brief Like xstrsplit(), with every delimiter as a token of its own.
+ * @return The array (XArray_Destroy() frees it), or NULL when there is no token at all.
+ */
+xarray_t* xstrsplitd(const char *pString, const char *pDlmt)
+{
+    if (!xstrused(pString) || !xstrused(pDlmt)) return NULL;
+
+    xarray_t *pArray = XArray_NewPool(XSTDNON, XSTDNON, XFALSE);
+    if (pArray == NULL) return NULL;
+
+    xstrsplita(pString, pDlmt, pArray, XTRUE, XFALSE);
+    if (pArray->nUsed) return pArray;
+
+    XArray_Destroy(pArray);
+    return NULL;
+}
+
+/*!
+ * @brief Like xstrsplit(), keeping empty tokens as empty strings.
+ * @return The array (XArray_Destroy() frees it), or NULL when there is no token at all.
+ */
+xarray_t* xstrsplite(const char *pString, const char *pDlmt)
+{
+    if (!xstrused(pString) || !xstrused(pDlmt)) return NULL;
+
+    xarray_t *pArray = XArray_NewPool(XSTDNON, XSTDNON, XFALSE);
+    if (pArray == NULL) return NULL;
+
+    xstrsplita(pString, pDlmt, pArray, XFALSE, XTRUE);
+    if (pArray->nUsed) return pArray;
+
+    XArray_Destroy(pArray);
+    return NULL;
+}
+
+/////////////////////////////////////////////////////////////////////////
+// XString Implementation
+/////////////////////////////////////////////////////////////////////////
+
+int XString_Status(xstring_t *pString)
+{
+    if (pString == NULL) return XSTDERR;
+    return (pString->nStatus == XSTDERR) ?
+        XSTDERR : (int)pString->nLength;
+}
+
+int XString_Resize(xstring_t *pString, size_t nSize)
+{
+    /* The size comes back as an int */
+    if (pString == NULL || nSize > INT_MAX) return XSTDERR;
+    if (pString->pData == NULL && nSize)
+    {
+        pString->pData = (char*)malloc(nSize);
+        if (pString->pData == NULL)
+        {
+            pString->nStatus = XSTDERR;
+            return pString->nStatus;
+        }
+
+        pString->nSize = nSize;
+        pString->nLength = 0;
+        return (int)nSize;
+    }
+    else if (!pString->nSize && nSize)
+    {
+        char *pOldBuff = pString->pData;
+        char *pNewBuff = (char*)malloc(nSize);
+
+        if (pNewBuff == NULL)
+        {
+            pString->nStatus = XSTDERR;
+            return pString->nStatus;
+        }
+
+        pString->nLength = xstrncpys(pNewBuff, nSize, pOldBuff, pString->nLength);
+        pString->pData = pNewBuff;
+        pString->nSize = nSize;
+        return (int)nSize;
+    }
+    else if (pString->pData && pString->nSize && !nSize)
+    {
+        free(pString->pData);
+        pString->pData = NULL;
+        pString->nLength = 0;
+        pString->nSize = 0;
+        return 0;
+    }
+    else if (!nSize)
+    {
+        pString->pData = NULL;
+        pString->nLength = 0;
+        pString->nSize = 0;
+        return 0;
+    }
+
+    char* pOldData = pString->pData;
+    pString->pData = (char*)realloc(pString->pData, nSize);
+
+    if (nSize && pString->pData == NULL)
+    {
+        pString->pData = pOldData;
+        pString->nStatus = XSTDERR;
+        return pString->nStatus;
+    }
+
+    if (pString->nLength >= nSize)
+    {
+        pString->nLength = nSize - 1;
+        pString->pData[pString->nLength] = XSTR_NUL;
+    }
+
+    pString->nSize = nSize;
+    return (int)pString->nSize;
+}
+
+int XString_Increase(xstring_t *pString, size_t nSize)
+{
+    if (pString == NULL || pString->nStatus == XSTDERR) return XSTDERR;
+
+    /* A sum or a doubling that wrapped round came back as a smaller size,
+       which was then reported as room for nSize more */
+    if (pString->nLength > INT_MAX || nSize > (size_t)INT_MAX - pString->nLength) return XSTDERR;
+    size_t nNewSize = pString->nLength + nSize;
+
+    if (nNewSize <= pString->nSize) return (int)pString->nSize;
+    else if (pString->nFast && nNewSize <= INT_MAX / 2) nNewSize *= 2;
+    return XString_Resize(pString, nNewSize);
+}
+
+int XString_Init(xstring_t *pString, size_t nSize, uint8_t nFastAlloc)
+{
+    if (pString == NULL) return XSTDERR;
+    pString->nStatus = 0;
+    pString->nLength = 0;
+    pString->nAlloc = 0;
+    pString->nSize = 0;
+    pString->pData = NULL;
+    pString->nFast = nFastAlloc;
+
+    XString_Resize(pString, nSize);
+
+    if (nSize && pString->pData != NULL &&
+        pString->nStatus != XSTDERR)
+        pString->pData[pString->nLength] = XSTR_NUL;
+
+    return XString_Status(pString);
+}
+
+void XString_Clear(xstring_t *pString)
+{
+    if (pString == NULL) return;
+
+    if (pString->nSize > 0 &&
+        pString->pData != NULL)
+        free(pString->pData);
+
+    if (pString->nAlloc)
+    {
+        free(pString);
+        return;
+    }
+
+    pString->nStatus = XSTDNON;
+    pString->nLength = 0;
+    pString->nSize = 0;
+    pString->pData = NULL;
+}
+
+int XString_Set(xstring_t *pString, char *pData, size_t nLength)
+{
+    if (pString == NULL) return XSTDERR;
+    pString->nStatus = XSTDNON;
+    pString->nLength = nLength;
+    pString->pData = pData;
+    pString->nSize = 0;
+    return (int)pString->nLength;
+}
+
+int XString_Add(xstring_t *pString, const char *pData, size_t nLength)
+{
+    if (pString == NULL || (pData == NULL && nLength)) return XSTDERR;
+    if (!nLength) return (int)pString->nLength;
+    if (nLength >= INT_MAX || pString->nLength > INT_MAX - nLength - 1) return XSTDERR;
+
+    uintptr_t nSource = (uintptr_t)pData, nBase = (uintptr_t)pString->pData;
+    xbool_t bAlias = pString->pData && nSource >= nBase && nSource - nBase <= pString->nLength;
+    size_t nOffset = bAlias ? (size_t)(nSource - nBase) : 0;
+
+    if (bAlias && nLength > pString->nLength - nOffset) return XSTDERR;
+    if (XString_Increase(pString, nLength + 1) <= 0) return XSTDERR;
+    if (bAlias) pData = pString->pData + nOffset;
+
+    memmove(pString->pData + pString->nLength, pData, nLength);
+    pString->nLength += nLength;
+    pString->pData[pString->nLength] = XSTR_NUL;
+
+    return (int)pString->nLength;
+}
+
+int XString_Append(xstring_t *pString, const char *pFmt, ...)
+{
+    size_t nBytes = 0;
+    char *pDest = NULL;
+    if (pString == NULL) return XSTDERR;
+
+    XSTRCPYFMT(pDest, pFmt, &nBytes);
+    if (pDest == NULL)
+    {
+        pString->nStatus = XSTDERR;
+        return XSTDERR;
+    }
+
+    XString_Add(pString, pDest, nBytes);
+    free(pDest);
+
+    return XString_Status(pString);
+}
+
+int XString_AddString(xstring_t *pString, xstring_t *pSrc)
+{
+    if (pString == NULL || pSrc == NULL || pSrc->pData == NULL || !pSrc->nLength) return XSTDERR;
+    XString_Add(pString, pSrc->pData, pSrc->nLength);
+    return XString_Status(pString);
+}
+
+int XString_Copy(xstring_t *pString, xstring_t *pSrc)
+{
+    if (pString == NULL || pSrc == NULL || pSrc->pData == NULL) return XSTDERR;
+    size_t nSize = XSTD_MAX(pSrc->nSize, pSrc->nLength + 1);
+
+    XString_Init(pString, nSize, pSrc->nFast);
+    if (pString->nStatus == XSTDERR || pString->pData == NULL) return XSTDERR;
+
+    memcpy(pString->pData, pSrc->pData, pSrc->nLength);
+    pString->nLength = pSrc->nLength;
+    pString->pData[pString->nLength] = XSTR_NUL;
+    return (int)pString->nLength;
+}
+
+int XString_Insert(xstring_t *pString, size_t nPosit, const char *pData, size_t nLength)
+{
+    if (pString == NULL || (pData == NULL && nLength)) return XSTDERR;
+    if (nPosit >= pString->nLength) return XString_Add(pString, pData, nLength);
+
+    if (!nLength) return (int)pString->nLength;
+    if (nLength >= INT_MAX || pString->nLength > INT_MAX - nLength - 1) return XSTDERR;
+
+    char *pCopy = NULL;
+    uintptr_t nSource = (uintptr_t)pData, nBase = (uintptr_t)pString->pData;
+    if (pString->pData && nSource >= nBase && nSource - nBase <= pString->nLength)
+    {
+        if (nLength > pString->nLength - (size_t)(nSource - nBase)) return XSTDERR;
+        pCopy = (char*)malloc(nLength);
+        if (pCopy == NULL) return XSTDERR;
+
+        memcpy(pCopy, pData, nLength);
+        pData = pCopy;
+    }
+
+    if (XString_Increase(pString, nLength + 1) <= 0)
+    {
+        free(pCopy);
+        return XSTDERR;
+    }
+
+    char *pOffset = pString->pData + nPosit;
+    memmove(pOffset + nLength, pOffset, pString->nLength - nPosit + 1);
+    memcpy(pOffset, pData, nLength);
+    free(pCopy);
+
+    pString->nLength += nLength;
+    return (int)pString->nLength;
+}
+
+int XString_InsertFmt(xstring_t *pString, size_t nPosit, const char *pFmt, ...)
+{
+    char *pDest = NULL;
+    size_t nBytes = 0;
+    if (pString == NULL) return XSTDERR;
+
+    XSTRCPYFMT(pDest, pFmt, &nBytes);
+    if (pDest == NULL)
+    {
+        pString->nStatus = XSTDERR;
+        return XSTDERR;
+    }
+
+    XString_Insert(pString, nPosit, pDest, nBytes);
+    free(pDest);
+
+    return XString_Status(pString);
+}
+
+int XString_Remove(xstring_t *pString, size_t nPosit, size_t nSize)
+{
+    if (pString == NULL) return XSTDERR;
+    if (!nSize || nPosit >= pString->nLength) return 0;
+    nSize = ((nPosit + nSize) > pString->nLength) ?
+            pString->nLength - nPosit : nSize;
+
+    size_t nTailOffset = nPosit + nSize;
+    if (nTailOffset >= pString->nLength)
+    {
+        pString->nLength = nPosit;
+        pString->pData[pString->nLength] = XSTR_NUL;
+        return (int)pString->nLength;
+    }
+
+    size_t nTailSize = pString->nLength - nTailOffset;
+    const char *pTail = &pString->pData[nTailOffset];
+    memmove(&pString->pData[nPosit], pTail, nTailSize);
+
+    pString->nLength -= nSize;
+    pString->pData[pString->nLength] = XSTR_NUL;
+    return (int)pString->nLength;
+}
+
+int XString_Delete(xstring_t *pString, size_t nPosit, size_t nSize)
+{
+    if (pString == NULL) return XSTDERR;
+    XString_Remove(pString, nPosit, nSize);
+    XString_Resize(pString, pString->nLength + 1);
+    return XString_Status(pString);
+}
+
+int XString_Advance(xstring_t *pString, size_t nSize)
+{
+    XString_Delete(pString, 0, nSize);
+    return XString_Status(pString);
+}
+
+int XString_Case(xstring_t *pString, xstr_case_t eCase, size_t nPosit, size_t nSize)
+{
+    if (pString == NULL || pString->pData == NULL) return XSTDERR;
+    size_t i, nStart = XSTD_MIN(nPosit, pString->nLength);
+    size_t nLength = XSTD_MIN(nStart + nSize, pString->nLength);
+
+    for (i = nStart; i < nLength; i++)
+    {
+        switch (eCase)
+        {
+            case XSTR_LOWER:
+                pString->pData[i] = (char)tolower(pString->pData[i]);
+                break;
+            case XSTR_UPPER:
+                pString->pData[i] = (char)toupper(pString->pData[i]);
+                break;
+            default:
+                break;
+        }
+    }
+
+    return (int)pString->nLength;
+}
+
+int XString_ChangeCase(xstring_t *pString, xstr_case_t eCase)
+{
+    if (pString == NULL || pString->pData == NULL || !pString->nLength) return XSTDERR;
+    XString_Case(pString, eCase, 0, pString->nLength);
+    return (pString->nStatus == XSTDERR) ? XSTDERR : (int)pString->nLength;
+}
+
+int XString_Color(xstring_t *pString, const char* pClr, size_t nPosit, size_t nSize)
+{
+    if (pString == NULL || pClr == NULL || pString->pData == NULL || !pString->nLength) return XSTDERR;
+    size_t nFirstPart = XSTD_MIN(nPosit, pString->nLength);
+    size_t nLastPart = nFirstPart + nSize;
+    size_t nLastSize = pString->nLength - nLastPart;
+
+    if (nFirstPart >= pString->nLength ||
+        nLastPart > pString->nLength) return XSTDERR;
+
+    xstring_t *pTempStr = XString_New(pString->nLength, pString->nFast);
+    if (pTempStr == NULL) return XSTDERR;
+
+    if ((XString_Add(pTempStr, pString->pData, nFirstPart) == XSTDERR) ||
+        (XString_Add(pTempStr, pClr, strnlen(pClr, XSTR_MICRO)) == XSTDERR) ||
+        (XString_Add(pTempStr, &pString->pData[nFirstPart], nSize) == XSTDERR) ||
+        (XString_Add(pTempStr, XSTR_FMT_RESET, strlen(XSTR_FMT_RESET)) == XSTDERR) ||
+        (XString_Add(pTempStr, &pString->pData[nLastPart], nLastSize) == XSTDERR))
+    {
+        XString_Clear(pTempStr);
+        return XSTDERR;
+    }
+
+    pString->nLength = 0;
+    XString_AddString(pString, pTempStr);
+    XString_Clear(pTempStr);
+
+    return XString_Status(pString);
+}
+
+int XString_ChangeColor(xstring_t *pString, const char* pClr)
+{
+    if (pString == NULL || pString->pData == NULL || !pString->nLength) return XSTDERR;
+    XString_Color(pString, pClr, 0, pString->nLength);
+    return XString_Status(pString);
+}
+
+/*!
+ * @brief Search for pSearch in pString starting at nPos.
+ * @return Offset of the match from nPos (not from the start), or XSTDERR (-1); 0 is a match at nPos.
+ */
+int XString_Search(xstring_t *pString, size_t nPos, const char *pSearch)
+{
+    if (pString == NULL || nPos >= pString->nLength) return XSTDERR;
+    return xstrsrc(&pString->pData[nPos], pSearch);
+}
+
+/*!
+ * @brief Copies the token from nPosit up to the delimiter string pDlmt, like xstrntok().
+ * @return Next position, 0 for the last token, XSTDERR (-1) past the end.
+ * @note Unlike xstrntok(), an empty token (pDlmt right at nPosit) is none:
+ *       pDst gets the rest of the string and 0 is returned.
+ */
+int XString_Tokenize(xstring_t *pString, char *pDst, size_t nSize, size_t nPosit, const char *pDlmt)
+{
+    if (pString == NULL || !pString->nLength) return XSTDERR;
+    else if (pDst != NULL) pDst[0] = XSTR_NUL;
+
+    if (nPosit >= pString->nLength) return XSTDERR;
+    int nOffset = xstrsrc(&pString->pData[nPosit], pDlmt);
+
+    if (nOffset <= 0)
+    {
+        xstrncpy(pDst, nSize, &pString->pData[nPosit]);
+        return 0;
+    }
+
+    xstrncpys(pDst, nSize, &pString->pData[nPosit], nOffset);
+    return (int)nPosit + nOffset + (int)strlen(pDlmt);
+}
+
+/*!
+ * @brief Puts the token from nPosit up to the delimiter string pDlmt, like xstrntok().
+ * @return Next position, 0 for the last token, XSTDERR (-1) past the end or on failure.
+ * @note Unlike xstrntok(), an empty token (pDlmt right at nPosit) is none:
+ *       pDst gets the rest of the string and 0 is returned.
+ */
+int XString_Token(xstring_t *pString, xstring_t *pDst, size_t nPosit, const char *pDlmt)
+{
+    if (pString == NULL || pDst == NULL || !pString->nLength) return XSTDERR;
+
+    /* The destination is reset rather than initialized, and a string that
+       was initialized with no capacity owns no buffer to reset. */
+    if (pDst->pData != NULL) pDst->pData[0] = XSTR_NUL;
+    pDst->nLength = 0;
+
+    if (nPosit >= pString->nLength) return XSTDERR;
+    int nOffset = xstrsrc(&pString->pData[nPosit], pDlmt);
+
+    if (nOffset <= 0)
+    {
+        size_t nLength = pString->nLength - nPosit;
+        if (XString_Add(pDst, &pString->pData[nPosit], nLength) < 0) return XSTDERR;
+        return 0;
+    }
+
+    if (XString_Add(pDst, &pString->pData[nPosit], nOffset) < 0) return XSTDERR;
+    return (int)nPosit + nOffset + (int)strlen(pDlmt);
+}
+
+int XString_Replace(xstring_t *pString, const char *pRep, const char *pWith)
+{
+    if (pString == NULL || !pString->nLength || !xstrused(pRep) || pWith == NULL) return XSTDERR;
+
+    size_t nWithLen = strlen(pWith);
+    size_t nRepLen = strlen(pRep);
+    int nPos = 0;
+
+    int nOffset;
+    while ((nOffset = XString_Search(pString, nPos, pRep)) >= 0)
+    {
+        nPos += nOffset;
+        XString_Remove(pString, nPos, nRepLen);
+
+        if (XString_Insert(pString, nPos, pWith, nWithLen) < 0)
+            return XSTDERR;
+
+        nPos += (int)nWithLen;
+    }
+
+    return XString_Status(pString);
+}
+
+int XString_Sub(xstring_t *pString, char *pDst, size_t nDstSize, size_t nPos, size_t nSize)
+{
+    if (pString == NULL || nPos >= pString->nLength) return XSTDERR;
+    size_t nCopySize = XSTD_MIN(nSize, nDstSize);
+    size_t nPartSize = pString->nLength - nPos;
+    nCopySize = XSTD_MIN(nCopySize, nPartSize);
+    xstrncpys(pDst, nDstSize, &pString->pData[nPos], nCopySize);
+    return (int)nCopySize;
+}
+
+int XString_SubStr(xstring_t *pString, xstring_t *pSub, size_t nPos, size_t nSize)
+{
+    if (pString == NULL || pSub == NULL || nPos >= pString->nLength) return XSTDERR;
+    XString_Init(pSub, nSize + 1, pString->nFast);
+    if (pSub->nStatus == XSTDERR) return XSTDERR;
+
+    int nLength = XString_Sub(pString, pSub->pData, pSub->nSize, nPos, nSize);
+    if (nLength <= 0)
+    {
+        /* Release the substring that was just initialized here, not the
+           caller's source string: a failed cut used to destroy the input. */
+        XString_Clear(pSub);
+        return XSTDERR;
+    }
+
+    pSub->nLength = nLength;
+    return (int)pSub->nLength;
+}
+
+xstring_t *XString_SubNew(xstring_t *pString, size_t nPos, size_t nSize)
+{
+    xstring_t* pSub = (xstring_t*)malloc(sizeof(xstring_t));
+    if (pSub == NULL) return NULL;
+
+    if (XString_SubStr(pString, pSub, nPos, nSize) <= 0)
+    {
+        free(pSub);
+        return NULL;
+    }
+
+    pSub->nAlloc = 1;
+    return pSub;
+}
+
+xstring_t *XString_New(size_t nSize, uint8_t nFastAlloc)
+{
+    xstring_t* pString = (xstring_t*)malloc(sizeof(xstring_t));
+    if (pString == NULL) return NULL;
+
+    XString_Init(pString, nSize, nFastAlloc);
+    pString->nAlloc = 1;
+
+    if (pString->nStatus == XSTDERR)
+    {
+        XString_Clear(pString);
+        return NULL;
+    }
+
+    return pString;
+}
+
+xstring_t *XString_From(const char *pData, size_t nLength)
+{
+    if (pData == NULL || !nLength) return NULL;
+
+    xstring_t* pString = XString_New(nLength, 0);
+    if (pString == NULL) return NULL;
+
+    XString_Add(pString, pData, nLength);
+    if (pString->nStatus == XSTDERR)
+    {
+        XString_Clear(pString);
+        return NULL;
+    }
+
+    return pString;
+}
+
+xstring_t *XString_FromFmt(const char *pFmt, ...)
+{
+    size_t nBytes = 0;
+    char *pDest = NULL;
+
+    XSTRCPYFMT(pDest, pFmt, &nBytes);
+    if (pDest == NULL) return NULL;
+
+    xstring_t* pString = XString_From(pDest, nBytes);
+    free(pDest);
+
+    return pString;
+}
+
+int XString_InitFrom(xstring_t *pStr, const char *pFmt, ...)
+{
+    size_t nBytes = 0;
+    char *pDest = NULL;
+    if (pStr == NULL) return XSTDERR;
+
+    XSTRCPYFMT(pDest, pFmt, &nBytes);
+    if (pDest == NULL) return XSTDERR;
+
+    if (XString_Init(pStr, nBytes, 0) == XSTDERR ||
+        XString_Add(pStr, pDest, nBytes) == XSTDERR)
+    {
+        XString_Clear(pStr);
+        free(pDest);
+        return XSTDERR;
+    }
+
+    free(pDest);
+    return (int)pStr->nLength;
+}
+
+xstring_t *XString_FromStr(xstring_t *pString)
+{
+    if (pString == NULL || !pString->nLength) return NULL;
+    return XString_From(pString->pData, pString->nLength);
+}
+
+int XString_Cut(xstring_t *pString, char *pDst, size_t nSize, const char *pFrom, const char *pTo)
+{
+    if (pString == NULL || !pString->nLength) return XSTDERR;
+    int nStartPos = XString_Search(pString, 0, pFrom);
+    if (nStartPos < 0) return XSTDERR;
+
+    int nSubSize = 0;
+    nStartPos += (int)strlen(pFrom);
+
+    if ((size_t)nStartPos >= pString->nLength) return XSTDERR;
+    if (pTo == NULL) nSubSize = (int)pString->nLength - nStartPos;
+    else nSubSize = XString_Search(pString, (size_t)nStartPos, pTo);
+
+    if (nSubSize < 0) return XSTDERR;
+    xstrncpys(pDst, nSize, &pString->pData[nStartPos], nSubSize);
+    return nSubSize;
+}
+
+int XString_CutSub(xstring_t *pString, xstring_t *pSub, const char *pFrom, const char *pTo)
+{
+    if (pString == NULL || pSub == NULL || !pString->nLength) return XSTDERR;
+    XString_Init(pSub, pString->nLength, pString->nFast);
+    if (pSub->nStatus == XSTDERR) return XSTDERR;
+
+    int nLength = XString_Cut(pString, pSub->pData, pSub->nSize, pFrom, pTo);
+    if (nLength <= 0)
+    {
+        XString_Clear(pSub);
+        return XSTDERR;
+    }
+
+    pSub->nLength = nLength;
+    return (int)pSub->nLength;
+}
+
+xstring_t *XString_CutNew(xstring_t *pString, const char *pFrom, const char *pTo)
+{
+    xstring_t* pSub = (xstring_t*)malloc(sizeof(xstring_t));
+    if (pSub == NULL) return NULL;
+
+    if (XString_CutSub(pString, pSub, pFrom, pTo) == XSTDERR)
+    {
+        free(pSub);
+        return NULL;
+    }
+
+    pSub->nAlloc = 1;
+    return pSub;
+}
+
+void XString_ArrayClearCb(xarray_data_t *pArrData)
+{
+    if (pArrData == NULL || pArrData->pData == NULL) return;
+    xstring_t *pString = (xstring_t*)pArrData->pData;
+    XString_Clear(pString);
+}
+
+xarray_t* XString_SplitStr(xstring_t *pString, const char *pDlmt)
+{
+    if (pString == NULL || !pString->nLength) return NULL;
+
+    xstring_t *pToken = XString_New(XSTR_MID, 0);
+    if (pToken == NULL) return NULL;
+
+    xarray_t *pArray = XArray_NewPool(XSTDNON, 2, 0);
+    if (pArray == NULL)
+    {
+        XString_Clear(pToken);
+        return NULL;
+    }
+
+    pArray->clearCb = XString_ArrayClearCb;
+    int nNext = 0;
+
+    while ((nNext = XString_Token(pString, pToken, nNext, pDlmt)) >= 0)
+    {
+        xarray_data_t *pItem = XArray_NewData(pArray, pToken, 0, 0);
+        if (pItem == NULL)
+        {
+            XString_Clear(pToken);
+            XArray_Destroy(pArray);
+            return NULL;
+        }
+
+        /* XArray_Add releases pItem (and its string) on failure. */
+        if (XArray_Add(pArray, pItem) < 0)
+        {
+            XArray_Destroy(pArray);
+            return NULL;
+        }
+
+        pToken = NULL;
+        if (!nNext) break;
+
+        pToken = XString_New(XSTR_MID, 0);
+        if (pToken == NULL)
+        {
+            XArray_Destroy(pArray);
+            return NULL;
+        }
+    }
+
+    if (pToken != NULL && pToken->nStatus == XSTDERR)
+    {
+        XString_Clear(pToken);
+        XArray_Destroy(pArray);
+        return NULL;
+    }
+
+    XString_Clear(pToken);
+
+    if (!pArray->nUsed)
+    {
+        XArray_Destroy(pArray);
+        return NULL;
+    }
+
+    return pArray;
+}
+
+xarray_t* XString_Split(const char *pCStr, const char *pDlmt)
+{
+    if (pCStr == NULL) return NULL;
+    xstring_t *pString = XString_From(pCStr, strlen(pCStr));
+    if (pString == NULL) return NULL;
+
+    xarray_t *pArray = XString_SplitStr(pString, pDlmt);
+    XString_Clear(pString);
+    return pArray;
+}

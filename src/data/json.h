@@ -1,0 +1,212 @@
+/*!
+ *  @file libxutils/src/data/json.h
+ *
+ *  This source is part of the "libxutils" project
+ *  2019-2021  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief Implementation of the lexical analyzer
+ * and recursive descent parser with JSON grammar
+ */
+
+#include "xstd.h"
+#include "array.h"
+#include "pool.h"
+
+#ifndef __XUTILS_JSON_H__
+#define __XUTILS_JSON_H__
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define XJSON_SUCCESS     1
+#define XJSON_FAILURE     0
+
+typedef enum {
+    XJSON_TOKEN_INVALID = (uint8_t)0,
+    XJSON_TOKEN_COMMA,
+    XJSON_TOKEN_COLON,
+    XJSON_TOKEN_QUOTE,
+    XJSON_TOKEN_LCURLY,
+    XJSON_TOKEN_RCURLY,
+    XJSON_TOKEN_LPAREN,
+    XJSON_TOKEN_RPAREN,
+    XJSON_TOKEN_LSQUARE,
+    XJSON_TOKEN_RSQUARE,
+    XJSON_TOKEN_INTEGER,
+    XJSON_TOKEN_FLOAT,
+    XJSON_TOKEN_BOOL,
+    XJSON_TOKEN_NULL,
+    XJSON_TOKEN_EOF
+} xjson_token_type_t;
+
+typedef struct xjson_token_ {
+    xjson_token_type_t nType;
+    const char *pData;
+    size_t nLength;
+} xjson_token_t;
+
+typedef enum {
+    XJSON_TYPE_INVALID = (uint8_t)0,
+    XJSON_TYPE_OBJECT,
+    XJSON_TYPE_ARRAY,
+    XJSON_TYPE_BOOLEAN,
+    XJSON_TYPE_STRING,
+    XJSON_TYPE_NUMBER,
+    XJSON_TYPE_FLOAT,
+    XJSON_TYPE_NULL,
+} xjson_type_t;
+
+typedef struct xjson_obj_ {
+    xjson_type_t nType;
+    uint8_t nAllowUpdate;
+    uint8_t nAllowLinter;
+    uint8_t nAllocated;
+    uint8_t nStrict;
+    xpool_t *pPool;
+    void *pData;
+    char *pName;
+} xjson_obj_t;
+
+typedef enum {
+    XJSON_ERR_NONE = (uint8_t)0,
+    XJSON_ERR_UNEXPECTED,
+    XJSON_ERR_INVALID,
+    XJSON_ERR_BOUNDS,
+    XJSON_ERR_EXITS,
+    XJSON_ERR_ALLOC,
+    XJSON_ERR_DEPTH
+} xjson_error_t;
+
+#define XJSON_MAX_DEPTH 128U
+
+xjson_obj_t *XJSON_FromStr(xpool_t *pPool, const char *pFmt, ...);
+xjson_obj_t* XJSON_CreateObject(xpool_t *pPool, const char *pName, void *pValue, xjson_type_t nType);
+xjson_obj_t* XJSON_NewObject(xpool_t *pPool, const char *pName, uint8_t nAllowUpdate);
+xjson_obj_t* XJSON_NewArray(xpool_t *pPool, const char *pName, uint8_t nAllowUpdate);
+xjson_obj_t* XJSON_NewU64(xpool_t *pPool, const char *pName, uint64_t nValue);
+xjson_obj_t* XJSON_NewU32(xpool_t *pPool, const char *pName, uint32_t nValue);
+xjson_obj_t* XJSON_NewU16(xpool_t *pPool, const char *pName, uint16_t nValue);
+xjson_obj_t* XJSON_NewInt(xpool_t *pPool, const char *pName, int nValue);
+xjson_obj_t* XJSON_NewFloat(xpool_t *pPool, const char *pName, double fValue);
+xjson_obj_t* XJSON_NewString(xpool_t *pPool, const char *pName, const char *pValue);
+xjson_obj_t* XJSON_NewBool(xpool_t *pPool, const char *pName, int nValue);
+xjson_obj_t* XJSON_NewNull(xpool_t *pPool, const char *pName);
+void XJSON_FreeObject(xjson_obj_t *pObj);
+
+#define XJSON_STRICT_OFF        0   /* Default: a member that fails to be added is simply not there */
+#define XJSON_STRICT_ON         1   /* Every member added so far is there */
+#define XJSON_STRICT_LOST       2   /* A member was lost to a failed allocation: the writer refuses the object */
+
+/* A strict object remembers when an add fails for want of memory, and XJSON_WriteObject (so every dump and
+   format) refuses it from then on: a document whose adds are not all checked is never written out with a
+   member missing. Containers created in a strict object by XJSON_GetOrCreate*, or added to it, become strict
+   too. Calling it again starts over, so a caller that has put back what was lost can declare it complete. */
+void XJSON_SetStrict(xjson_obj_t *pObj, xbool_t bStrict);
+
+xjson_error_t XJSON_AddObject(xjson_obj_t *pDst, xjson_obj_t *pSrc);
+xjson_error_t XJSON_AddU64(xjson_obj_t *pObject, const char *pName, uint64_t nValue);
+xjson_error_t XJSON_AddU32(xjson_obj_t *pObject, const char *pName, uint32_t nValue);
+xjson_error_t XJSON_AddU16(xjson_obj_t *pObject, const char *pName, uint16_t nValue);
+xjson_error_t XJSON_AddInt(xjson_obj_t *pObject, const char *pName, int nValue);
+xjson_error_t XJSON_AddFloat(xjson_obj_t *pObject, const char *pName, double fValue);
+xjson_error_t XJSON_AddString(xjson_obj_t *pObject, const char *pName, const char *pValue);
+xjson_error_t XJSON_AddStrIfUsed(xjson_obj_t *pObject, const char *pName, const char *pValue);
+xjson_error_t XJSON_AddBool(xjson_obj_t *pObject, const char *pName, int nValue);
+xjson_error_t XJSON_AddNull(xjson_obj_t *pObject, const char *pName);
+
+typedef struct xjson_ {
+    xjson_token_t lastToken;
+    xjson_error_t nError;
+    xjson_obj_t *pRootObj;
+    const char *pData;
+    xpool_t *pPool;
+    size_t nDataSize;
+    size_t nOffset;
+    size_t nDepth;
+} xjson_t;
+
+size_t XJSON_GetErrorStr(xjson_t *pJson, char *pOutput, size_t nSize);
+
+int XJSON_Parse(xjson_t *pJson, xpool_t *pPool, const char *pData, size_t nSize);
+void XJSON_Destroy(xjson_t *pJson);
+void XJSON_Init(xjson_t *pJson);
+
+/* Most members XJSON_ScanFlat looks at in one object */
+#define XJSON_SCAN_MEMBERS 32
+
+typedef struct xjson_field_ {
+    const char *pName;      /* Member to report, matched against what its name says, escapes decoded, as XJSON_GetObject does */
+    const char *pValue;     /* Its value as written in the input: a string without its quotes, escapes as written */
+    size_t nLength;         /* Length of pValue */
+    xjson_type_t nType;     /* XJSON_TYPE_INVALID when the object has no such member */
+} xjson_field_t;
+
+/* Reads the members named in pFields from a flat JSON object without building a tree or allocating anything.
+   The input goes through the parser's own lexer, and XTRUE means XJSON_Parse accepts it as well: one object,
+   every value a string, number, true, false or null, no name twice, nothing but whitespace after it. Values
+   point into pData. XFALSE refuses everything else - invalid input, but also arrays, nested values and objects
+   with more than XJSON_SCAN_MEMBERS members, so a caller that has to know more parses the input with XJSON_Parse. */
+xbool_t XJSON_ScanFlat(const char *pData, size_t nSize, xjson_field_t *pFields, size_t nCount);
+
+size_t XJSON_GetArrayLength(xjson_obj_t *pObj);
+int XJSON_RemoveArrayItem(xjson_obj_t *pObj, size_t nIndex);
+xarray_t* XJSON_GetObjects(xjson_obj_t *pObj);
+xjson_obj_t* XJSON_GetObject(xjson_obj_t *pObj, const char *pName);
+xjson_obj_t* XJSON_GetArrayItem(xjson_obj_t *pObj, size_t nIndex);
+xjson_obj_t *XJSON_GetOrCreateObject(xjson_obj_t *pObj, const char *pName, uint8_t nAllowUpdate);
+xjson_obj_t *XJSON_GetOrCreateArray(xjson_obj_t *pObj, const char *pName, uint8_t nAllowUpdate);
+
+const char* XJSON_GetString(xjson_obj_t *pObj);
+uint16_t XJSON_GetU16(xjson_obj_t *pObj);
+uint32_t XJSON_GetU32(xjson_obj_t *pObj);
+uint64_t XJSON_GetU64(xjson_obj_t *pObj);
+uint8_t XJSON_GetBool(xjson_obj_t *pObj);
+double XJSON_GetFloat(xjson_obj_t *pObj);
+int XJSON_GetInt(xjson_obj_t *pObj);
+
+typedef struct xjson_format_ {
+    char *pNameFmt;
+    char *pNameClr;
+    char *pFloatFmt;
+    char *pFloatClr;
+    char *pBoolFmt;
+    char *pBoolClr;
+    char *pStrFmt;
+    char *pStrClr;
+    char *pNumFmt;
+    char *pNumClr;
+    char *pNullFmt;
+    char *pNullClr;
+} xjson_format_t;
+
+typedef struct xjson_writer_ {
+    xjson_format_t format;
+    uint8_t nPretty;
+    size_t nTabSize;
+    size_t nIndents;
+    size_t nLength;
+    size_t nAvail;
+    size_t nSize;
+    char *pData;
+    xpool_t *pPool;
+    uint8_t nAlloc;
+} xjson_writer_t;
+
+void XJSON_DestroyWriter(xjson_writer_t *pWriter);
+int XJSON_InitWriter(xjson_writer_t *pWriter, xpool_t *pPool, char *pOutput, size_t nSize);
+int XJSON_WriteObject(xjson_obj_t *pObj, xjson_writer_t *pWriter);
+int XJSON_Write(xjson_t *pJson, char *pOutput, size_t nSize);
+
+void XJSON_FormatInit(xjson_format_t *pFormat);
+char* XJSON_FormatObj(xjson_obj_t *pJsonObj, size_t nTabSize, xjson_format_t *pFormat, size_t *pLength);
+char* XJSON_Format(xjson_t *pJson, size_t nTabSize, xjson_format_t *pFormat, size_t *pLength);
+
+char* XJSON_DumpObj(xjson_obj_t *pJsonObj, size_t nTabSize, size_t *pLength);
+char* XJSON_Dump(xjson_t *pJson, size_t nTabSize, size_t *pLength);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __XUTILS_JSON_H__ */

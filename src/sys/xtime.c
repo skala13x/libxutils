@@ -1,0 +1,535 @@
+/*!
+ *  @file libxutils/src/sys/xtime.c
+ *
+ *  This source is part of the "libxutils" project
+ *  2015-2020  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief Get system date, convert between formats,
+ * get month days, calculate leap year, and e.t.c.
+ */
+
+#include "xtime.h"
+#include "str.h"
+
+#if defined(__linux__) && defined(CLOCK_REALTIME)
+#define XTIME_USE_CLOCK
+#endif
+
+void XTime_Init(xtime_t *pTime)
+{
+    XCHECK_VOID_NL((pTime != NULL));
+    pTime->nYear = pTime->nMonth = 0;
+    pTime->nDay = pTime->nHour = 0;
+    pTime->nMin = pTime->nSec = 0;
+    pTime->nFraq = 0;
+}
+
+static int XTime_SetParsed(xtime_t *pTime, int nParsed, int nExpected,
+                           unsigned int nYear, unsigned int nMonth,
+                           unsigned int nDay, unsigned int nHour,
+                           unsigned int nMin, unsigned int nSec,
+                           unsigned int nFraq)
+{
+    if (nParsed != nExpected || !nYear || nYear > UINT16_MAX || !nMonth || nMonth > 12 ||
+        !nDay || nDay > (unsigned int)XTime_GetMonthDays((int)nYear, (int)nMonth) ||
+        nHour > 23 || nMin > 59 || nSec > 59 || nFraq > XTIME_FRAQ_MAX) return 0;
+
+    pTime->nYear = (uint16_t)nYear;
+    pTime->nMonth = (uint8_t)nMonth;
+    pTime->nDay = (uint8_t)nDay;
+    pTime->nHour = (uint8_t)nHour;
+    pTime->nMin = (uint8_t)nMin;
+    pTime->nSec = (uint8_t)nSec;
+    pTime->nFraq = (uint8_t)nFraq;
+    return nParsed;
+}
+
+void XTime_FromTm(xtime_t *pTime, const struct tm *pTm)
+{
+    XCHECK_VOID_NL((pTime != NULL && pTm != NULL));
+    pTime->nYear = (uint16_t)pTm->tm_year+1900;
+    pTime->nMonth = (uint8_t)pTm->tm_mon+1;
+    pTime->nDay = (uint8_t)pTm->tm_mday;
+    pTime->nHour = (uint8_t)pTm->tm_hour;
+    pTime->nMin = (uint8_t)pTm->tm_min;
+    pTime->nSec = (uint8_t)pTm->tm_sec;
+    pTime->nFraq = 0;
+}
+
+int XTime_FromStr(xtime_t *pTime, const char *pStr)
+{
+    XCHECK((pTime != NULL && xstrused(pStr)), 0);
+    XTime_Init(pTime);
+
+    unsigned int nYear = 0, nMonth = 0, nDay = 0;
+    unsigned int nHour = 0, nMin = 0, nSec = 0, nFraq = 0;
+#ifdef _WIN32
+    int nParsed = sscanf_s(pStr, "%04u%02u%02u%02u%02u%02u%02u",
+        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec, &nFraq);
+#else
+    int nParsed = sscanf(pStr, "%04u%02u%02u%02u%02u%02u%02u",
+        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec, &nFraq);
+#endif
+
+    return XTime_SetParsed(pTime, nParsed, 7, nYear, nMonth, nDay, nHour, nMin, nSec, nFraq);
+}
+
+int XTime_FromHstr(xtime_t *pTime, const char *pStr)
+{
+    XCHECK((pTime != NULL && xstrused(pStr)), 0);
+    XTime_Init(pTime);
+
+    unsigned int nYear = 0, nMonth = 0, nDay = 0;
+    unsigned int nHour = 0, nMin = 0, nSec = 0, nFraq = 0;
+#ifdef _WIN32
+    int nParsed = sscanf_s(pStr, "%04u.%02u.%02u-%02u:%02u:%02u.%02u",
+        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec, &nFraq);
+#else
+    int nParsed = sscanf(pStr, "%04u.%02u.%02u-%02u:%02u:%02u.%02u",
+        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec, &nFraq);
+#endif
+
+    return XTime_SetParsed(pTime, nParsed, 7, nYear, nMonth, nDay, nHour, nMin, nSec, nFraq);
+}
+
+int XTime_FromLstr(xtime_t *pTime, const char *pStr)
+{
+    XCHECK((pTime != NULL && xstrused(pStr)), 0);
+    XTime_Init(pTime);
+
+    unsigned int nYear = 0, nMonth = 0, nDay = 0;
+    unsigned int nHour = 0, nMin = 0, nSec = 0;
+#ifdef _WIN32
+    int nParsed = sscanf_s(pStr, "%04u/%02u/%02u/%02u/%02u/%02u",
+        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec);
+#else
+    int nParsed = sscanf(pStr, "%04u/%02u/%02u/%02u/%02u/%02u",
+        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec);
+#endif
+
+    return XTime_SetParsed(pTime, nParsed, 6, nYear, nMonth, nDay, nHour, nMin, nSec, 0);
+}
+
+int XTime_FromRstr(xtime_t *pTime, const char *pStr)
+{
+    XCHECK((pTime != NULL && xstrused(pStr)), 0);
+    XTime_Init(pTime);
+
+    unsigned int nYear = 0, nMonth = 0, nDay = 0;
+    unsigned int nHour = 0, nMin = 0, nSec = 0, nFraq = 0;
+#ifdef _WIN32
+    int nParsed = sscanf_s(pStr, "%02u/%02u/%04u %02u:%02u:%02u.%02u",
+        &nMonth, &nDay, &nYear, &nHour, &nMin, &nSec, &nFraq);
+#else
+    int nParsed = sscanf(pStr, "%02u/%02u/%04u %02u:%02u:%02u.%02u",
+        &nMonth, &nDay, &nYear, &nHour, &nMin, &nSec, &nFraq);
+#endif
+
+    /* XTime_ToRstr() emits no fraction, so six fields is a complete date
+       here. Demanding all seven made this reject its own output. */
+    return XTime_SetParsed(pTime, nParsed, nParsed == 7 ? 7 : 6,
+        nYear, nMonth, nDay, nHour, nMin, nSec, nFraq);
+}
+
+int XTime_FromISO(xtime_t *pTime, const char *pStr)
+{
+    XCHECK((pTime != NULL && xstrused(pStr)), 0);
+    XTime_Init(pTime);
+
+    unsigned int nYear = 0, nMonth = 0, nDay = 0;
+    unsigned int nHour = 0, nMin = 0, nSec = 0;
+#ifdef _WIN32
+    int nParsed = sscanf_s(pStr, "%04u-%02u-%02uT%02u:%02u:%02u",
+        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec);
+#else
+    int nParsed = sscanf(pStr, "%04u-%02u-%02uT%02u:%02u:%02u",
+        &nYear, &nMonth, &nDay, &nHour, &nMin, &nSec);
+#endif
+
+    return XTime_SetParsed(pTime, nParsed, 6, nYear, nMonth, nDay, nHour, nMin, nSec, 0);
+}
+
+void XTime_FromEpoch(xtime_t *pTime, const time_t nTime)
+{
+    XCHECK_VOID_NL((pTime != NULL));
+    struct tm timeinfo;
+#ifdef _WIN32
+    localtime_s(&timeinfo, &nTime);
+#else
+    localtime_r(&nTime, &timeinfo);
+#endif
+    XTime_FromTm(pTime, &timeinfo);
+    pTime->nFraq = 0;
+}
+
+void XTime_Deserialize(xtime_t *pTime, const uint64_t nTime)
+{
+    XCHECK_VOID_NL((pTime != NULL));
+    pTime->nYear = XTIME_U64_YEAR(nTime);
+    pTime->nMonth = XTIME_U64_MONTH(nTime);
+    pTime->nDay = XTIME_U64_DAY(nTime);
+    pTime->nHour = XTIME_U64_HOUR(nTime);
+    pTime->nMin = XTIME_U64_MIN(nTime);
+    pTime->nSec = XTIME_U64_SEC(nTime);
+    int nFraq = XTIME_U64_FRAQ(nTime);
+    pTime->nFraq = (uint8_t)(nFraq > XTIME_FRAQ_MAX ? XTIME_FRAQ_MAX : nFraq);
+}
+
+void XTime_FromU64(xtime_t *pTime, const uint64_t nTime)
+{
+    XCHECK_VOID_NL((pTime != NULL));
+    xtimeu_t xtime;
+    xtime.uTime = nTime;
+    *pTime = xtime.time;
+}
+
+void XTime_ToTm(const xtime_t *pTime, struct tm *pTm)
+{
+    XCHECK_VOID_NL((pTime != NULL && pTm != NULL));
+    pTm->tm_year = pTime->nYear - 1900;
+    pTm->tm_mon = pTime->nMonth - 1;
+    pTm->tm_mday = pTime->nDay;
+    pTm->tm_hour = pTime->nHour;
+    pTm->tm_min = pTime->nMin;
+    pTm->tm_sec = pTime->nSec;
+    pTm->tm_isdst = -1;
+}
+
+uint64_t XTime_ToEpochLocal(const xtime_t *pTime)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    struct tm tminf;
+    XTime_ToTm(pTime, &tminf);
+    return (uint64_t)mktime(&tminf);
+}
+
+uint64_t XTime_ToEpochUTC(const xtime_t *pTime)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    struct tm tminf;
+    XTime_ToTm(pTime, &tminf);
+
+#ifdef _WIN32
+    return (uint64_t)_mkgmtime(&tminf);
+#else
+    return (uint64_t)timegm(&tminf);
+#endif
+}
+
+uint64_t XTime_ISOToEpochUTC(const char *pStr)
+{
+    xtime_t time;
+    if (XTime_FromISO(&time, pStr) > 0)
+        return XTime_ToEpochUTC(&time);
+    return 0;
+}
+
+size_t XTime_ToStr(const xtime_t *pTime, char *pStr, size_t nSize)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    return xstrncpyf(pStr, nSize, "%04d%02d%02d%02d%02d%02d%02d",
+        pTime->nYear, pTime->nMonth, pTime->nDay, pTime->nHour,
+        pTime->nMin, pTime->nSec, pTime->nFraq);
+}
+
+size_t XTime_ToHstr(const xtime_t *pTime, char *pStr, size_t nSize)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    return xstrncpyf(pStr, nSize, "%04d.%02d.%02d-%02d:%02d:%02d.%02d",
+        pTime->nYear, pTime->nMonth, pTime->nDay, pTime->nHour,
+        pTime->nMin, pTime->nSec, pTime->nFraq);
+}
+
+size_t XTime_ToLstr(const xtime_t *pTime, char *pStr, size_t nSize)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    return xstrncpyf(pStr, nSize, "%04d/%02d/%02d/%02d/%02d/%02d",
+        pTime->nYear, pTime->nMonth, pTime->nDay,
+        pTime->nHour, pTime->nMin, pTime->nSec);
+}
+
+size_t XTime_ToRstr(const xtime_t *pTime, char *pStr, size_t nSize)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    return xstrncpyf(pStr, nSize, "%02d/%02d/%04d %02d:%02d:%02d",
+        pTime->nMonth, pTime->nDay, pTime->nYear,
+        pTime->nHour, pTime->nMin, pTime->nSec);
+}
+
+size_t XTime_ToHTTP(const xtime_t *pTime, char *pStr, size_t nSize)
+{
+    XCHECK_NL((pTime != NULL && pStr != NULL && nSize), 0);
+    struct tm timeinfo;
+    time_t rawTime = XTime_ToEpochUTC(pTime);
+
+#ifdef _WIN32
+    gmtime_s(&timeinfo, &rawTime);
+#else
+    gmtime_r(&rawTime, &timeinfo);
+#endif
+
+    return strftime(pStr, nSize, "%a, %d %b %Y %H:%M:%S GMT", &timeinfo);
+}
+
+size_t XTime_ToISO(const xtime_t *pTime, char *pStr, size_t nSize)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    return xstrncpyf(pStr, nSize, "%04d-%02d-%02dT%02d:%02d:%02d",
+        pTime->nYear, pTime->nMonth, pTime->nDay,
+        pTime->nHour, pTime->nMin, pTime->nSec);
+}
+
+size_t XTime_ToISO8601(const xtime_t *pTime, char *pStr, size_t nSize)
+{
+    XCHECK_NL((pTime != NULL && pStr != NULL && nSize), 0);
+    struct tm timeinfo;
+    time_t rawTime = XTime_ToEpochUTC(pTime);
+
+#ifdef _WIN32
+    gmtime_s(&timeinfo, &rawTime);
+#else
+    gmtime_r(&rawTime, &timeinfo);
+#endif
+
+    return strftime(pStr, nSize, "%Y-%m-%dT%H:%M:%S.000Z", &timeinfo);
+}
+
+uint64_t XTime_ToU64(const xtime_t *pTime)
+{
+    XCHECK_NL(pTime, 0);
+    xtimeu_t xtime;
+    xtime.time = *pTime;
+    return xtime.uTime;
+}
+
+uint64_t XTime_Serialize(const xtime_t *pTime)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    uint64_t nTime;
+    nTime = (uint64_t)pTime->nYear;
+    nTime <<= 8;
+    nTime += (uint64_t)pTime->nMonth;
+    nTime <<= 8;
+    nTime += (uint64_t)pTime->nDay;
+    nTime <<= 8;
+    nTime += (uint64_t)pTime->nHour;
+    nTime <<= 8;
+    nTime += (uint64_t)pTime->nMin;
+    nTime <<= 8;
+    nTime += (uint64_t)pTime->nSec;
+    nTime <<= 8;
+    nTime += (uint64_t)pTime->nFraq;
+    return nTime;
+}
+
+int XTime_GetLeapYear(int nYear)
+{
+    int nRetVal = 0;
+
+    if (nYear % 4 == 0)
+    {
+        if (nYear % 100 == 0)
+        {
+            if (nYear % 400 == 0) nRetVal = 1;
+            else nRetVal = 0;
+        }
+        else nRetVal = 1;
+    }
+    else nRetVal = 0;
+
+    return nRetVal;
+}
+
+int XTime_GetMonthDays(int nYear, int nMonth)
+{
+    int nLeap = XTime_GetLeapYear(nYear);
+    if (nMonth == 2) return nLeap ? 29 : 28;
+
+    if (nMonth == 4 ||
+        nMonth == 6 ||
+        nMonth == 9 ||
+        nMonth == 11)
+        return 30;
+
+    return 31;
+}
+
+int XTime_MonthDays(const xtime_t *pTime)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    return XTime_GetMonthDays(pTime->nYear, pTime->nMonth);
+}
+
+int XTime_LeapYear(const xtime_t *pTime)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    return XTime_GetLeapYear(pTime->nYear);
+}
+
+double XTime_DiffSec(const xtime_t *pSrc1, const xtime_t *pSrc2)
+{
+    XCHECK_NL((pSrc1 != NULL && pSrc2 != NULL), 0.);
+    struct tm tm1, tm2;
+    XTime_ToTm(pSrc1, &tm1);
+    XTime_ToTm(pSrc2, &tm2);
+    return difftime(mktime(&tm1), mktime(&tm2));
+}
+
+double XTime_Diff(const xtime_t *pSrc1, const xtime_t *pSrc2, xtime_diff_t eDiff)
+{
+    double fSeconds = XTime_DiffSec(pSrc1, pSrc2);
+
+    switch (eDiff)
+    {
+        case XTIME_DIFF_YEAR: return fSeconds / XSECS_IN_YEAR;
+        case XTIME_DIFF_MONTH: return fSeconds / XSECS_IN_MONTH;
+        case XTIME_DIFF_WEEK: return fSeconds / XSECS_IN_WEEK;
+        case XTIME_DIFF_DAY: return fSeconds / XSECS_IN_DAY;
+        case XTIME_DIFF_HOUR: return fSeconds / XSECS_IN_HOUR;
+        case XTIME_DIFF_MIN: return fSeconds / XSECS_IN_MIN;
+        case XTIME_DIFF_SEC: return fSeconds;
+        default: break;
+    }
+
+    return fSeconds;
+}
+
+void XTime_Copy(xtime_t *pDst, const xtime_t *pSrc)
+{
+    XCHECK_VOID_NL((pDst && pSrc));
+    *pDst = *pSrc;
+}
+
+void XTime_Make(xtime_t *pSrc)
+{
+    XCHECK_VOID_NL((pSrc != NULL));
+    struct tm timeinfo;
+    XTime_ToTm(pSrc, &timeinfo);
+    mktime(&timeinfo);
+    XTime_FromTm(pSrc, &timeinfo);
+}
+
+int XTime_GetClock(xtime_spec_t *pTs)
+{
+    XCHECK_NL((pTs != NULL), XSTDERR);
+    pTs->nNanoSec = 0;
+    pTs->nSec = 0;
+#ifdef XTIME_USE_CLOCK
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) < 0) return XSTDERR;
+    pTs->nNanoSec = ts.tv_nsec;
+    pTs->nSec = ts.tv_sec;
+#elif _WIN32
+    const uint64_t nEpoch = ((uint64_t)116444736000000000ULL);
+    SYSTEMTIME sysTime;
+    FILETIME fileTime;
+    uint64_t nTime;
+
+    GetSystemTime(&sysTime);
+    SystemTimeToFileTime(&sysTime, &fileTime);
+    nTime = ((uint64_t)fileTime.dwLowDateTime);
+    nTime += ((uint64_t)fileTime.dwHighDateTime) << 32;
+
+    pTs->nNanoSec = ((uint64_t)sysTime.wMilliseconds * 1000000);
+    pTs->nSec = (time_t)((nTime - nEpoch) / 10000000L);
+#else
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) < 0) return XSTDERR;
+    pTs->nNanoSec = tv.tv_usec * 1000;
+    pTs->nSec = tv.tv_sec;
+#endif
+    return XSTDOK;
+}
+
+uint32_t XTime_GetUsec(void)
+{
+    xtime_spec_t now;
+    XTime_GetClock(&now);
+    return (uint32_t)(now.nNanoSec / 1000);
+}
+
+uint64_t XTime_GetStamp(void)
+{
+    xtime_spec_t now;
+    XTime_GetClock(&now);
+    uint64_t nTimeStamp = ((uint64_t)now.nNanoSec / 1000);
+    return (uint64_t)now.nSec * 1000000 + nTimeStamp;
+}
+
+uint32_t XTime_Get(xtime_t *pTime)
+{
+    XCHECK_NL((pTime != NULL), 0);
+    xtime_spec_t now;
+    XTime_GetClock(&now);
+    XTime_FromEpoch(pTime, now.nSec);
+    pTime->nFraq = (uint8_t)(now.nNanoSec / 10000000);
+    return (uint32_t)(now.nNanoSec / 1000);
+}
+
+size_t XTime_GetStr(char *pDst, size_t nSize, xtime_fmt_t eFmt)
+{
+    if (pDst == NULL || !nSize) return 0;
+
+    xtime_t date;
+    XTime_Get(&date);
+
+    switch (eFmt)
+    {
+        case XTIME_STR_SIMPLE: return XTime_ToStr(&date, pDst, nSize);
+        case XTIME_STR_HTTP: return XTime_ToHTTP(&date, pDst, nSize);
+        case XTIME_STR_LSTR: return XTime_ToLstr(&date, pDst, nSize);
+        case XTIME_STR_HSTR: return XTime_ToHstr(&date, pDst, nSize);
+        case XTIME_STR_ISO: return XTime_ToISO(&date, pDst, nSize);
+        case XTIME_STR_ISO8601: return XTime_ToISO8601(&date, pDst, nSize);
+        default: break;
+    }
+
+    pDst[0] = '\0';
+    return 0;
+}
+
+uint64_t XTime_GetU64(void)
+{
+    xtimeu_t xtime;
+    XTime_Get(&xtime.time);
+    return xtime.uTime;
+}
+
+uint64_t XTime_GetMs(void)
+{
+    xtime_spec_t now;
+    XTime_GetClock(&now);
+    uint64_t nTimeStamp = now.nNanoSec / 1000000;
+    return (uint64_t)now.nSec * 1000 + nTimeStamp;
+}
+
+uint64_t XTime_GetMonoMs(void)
+{
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+
+    /* Not reached on any supported system, but never worse than before */
+    return XTime_GetMs();
+#else
+    return XTime_GetMs();
+#endif
+}
+
+uint64_t XTime_Serialized(void)
+{
+    xtime_t xtime;
+    XTime_Get(&xtime);
+    return XTime_Serialize(&xtime);
+}
+
+void XTime_GetTm(struct tm *pTm)
+{
+    XCHECK_VOID_NL((pTm != NULL));
+    xtime_t xtime;
+    XTime_FromEpoch(&xtime, time(NULL));
+    XTime_ToTm(&xtime, pTm);
+}

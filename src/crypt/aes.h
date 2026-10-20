@@ -1,0 +1,99 @@
+/*!
+ *  @file libxutils/src/crypt/aes.h
+ *
+ *  This source is part of the "libxutils" project
+ *  2015-2025  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief Implementation of AES encryption based on tiny-AES-c project,
+ * which was released under The Unlicense (public domain dedication).
+ *
+ * Modified for libxutils:
+ * - Refactored code, adjusted function API.
+ * - Added AES-CBC mode support with PKCS#7 padding.
+ * - Added AES-XBC (CBC with random prefix) support to avoid PKCS#7 oracle issues.
+ * - Added AES-SIV (RFC 5297) support for deterministic authenticated encryption.
+ * - Added AES-CMAC (RFC 4493) and S2V support for synthetic IV derivation.
+ */
+
+#ifndef __XUTILS_AES_H__
+#define __XUTILS_AES_H__
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define XAES_RKEY_SIZE      240
+#define XAES_BLOCK_SIZE     16
+#define XAES_KEY_LENGTH     32
+#define XAES_CMAC_RB        0x87  /* Constant for doubling in GF(2^128) */
+#define XAES_XBC_HDR_SIZE   4     /* Header size for XBC mode (stores random prefix length) */
+
+typedef enum {
+    XAES_MODE_CBC = 0,      /* AES-CBC with PKCS#7 padding (default) */
+    XAES_MODE_XBC,          /* AES-XBC: CBC with random prefix instead of PKCS#7 padding */
+    XAES_MODE_SIV,          /* AES-SIV deterministic authenticated encryption (RFC 5297) */
+    XAES_MODE_SIV_NONCE     /* AES-SIV with a caller-supplied nonce (RFC 5297 nonce-based,
+                                non-deterministic). The nonce is the single associated-data
+                                string fed into S2V; set it with XAES_SetSIVNonce() after
+                                XAES_Init(). Output layout matches the XAES_MODE_SIV mode
+                                (siv_tag || ciphertext); the nonce itself is NOT embedded,
+                                so the caller is responsible for transmitting it. */
+} xaes_mode_t;
+
+typedef struct XXAESKey {
+    uint8_t aesKey[XAES_KEY_LENGTH];            /* AES key or CMAC key for SIV mode (RFC 4493) */
+    uint8_t ctrKey[XAES_KEY_LENGTH];            /* CTR key for SIV mode (RFC 5297) */
+    uint8_t IV[XAES_BLOCK_SIZE];                /* Initialization vector or nonce for SIV_NONCE mode */
+    uint8_t nContainIV;                         /* Flag to indicate if IV is self-contained in data */
+    size_t nKeySize;                            /* Key size in bits */
+} xaes_key_t;
+
+typedef struct XAESContext {
+    uint8_t cmacRoundKey[XAES_RKEY_SIZE];   /* CMAC round key for SIV mode */
+    uint8_t roundKey[XAES_RKEY_SIZE];       /* Encrypt/Decrypt round key (CTR key for SIV) */
+    uint8_t nNB;                            /* Number of columns (32-bit words) comprising the State */
+    uint8_t nNK;                            /* Number of 32-bit words comprising the Cipher Key */
+    uint8_t nNR;                            /* Number of rounds */
+} xaes_ctx_t;
+
+typedef struct XAES {
+    xaes_mode_t mode;                       /* Encryption mode */
+    xaes_key_t key;                         /* AES key context */
+    xaes_ctx_t ctx;                         /* AES context */
+} xaes_t;
+
+void XAES_InitSIVKey(xaes_key_t *pKey, const uint8_t *pMacKey, const uint8_t *pCtrKey, size_t nKeySize);
+void XAES_InitKey(xaes_key_t *pKey, const uint8_t *pAESKey, size_t nKeySize, const uint8_t *pIV, uint8_t bContainIV);
+int XAES_Init(xaes_t *pAES, const xaes_key_t *pKey, xaes_mode_t eMode);
+
+/* Set the nonce for XAES_MODE_SIV_NONCE. Must be called after XAES_Init() and before
+   XAES_Encrypt()/XAES_Decrypt(). The nonce must be exactly XAES_BLOCK_SIZE (16)
+   bytes; it becomes the associated-data string consumed by S2V (RFC 5297). The
+   caller owns nonce uniqueness/randomness (SIV stays nonce-misuse resistant: a
+   repeated nonce degrades to deterministic output, never to keystream reuse). */
+void XAES_SetSIVNonce(xaes_t *pAES, const uint8_t *pNonce, size_t nNonceLen);
+
+void XAES_ECB_Crypt(const xaes_t* pAES, uint8_t* pBuffer);
+void XAES_ECB_Decrypt(const xaes_t* pAES, uint8_t* pBuffer);
+
+uint8_t* XAES_CBC_Crypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength);
+uint8_t* XAES_CBC_Decrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength);
+
+uint8_t* XAES_SIV_Crypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength);
+uint8_t* XAES_SIV_Decrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength);
+
+uint8_t* XAES_XBC_Crypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength);
+uint8_t* XAES_XBC_Decrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength);
+
+uint8_t* XAES_Encrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength);
+uint8_t* XAES_Decrypt(xaes_t *pAES, const uint8_t *pInput, size_t *pLength);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __XUTILS_AES_H__ */

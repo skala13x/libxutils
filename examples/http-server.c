@@ -1,0 +1,322 @@
+/*!
+ *  @file libxutils/examples/http-server.c
+ *
+ *  This source is part of the "libxutils" project
+ *  2015-2020  Sandro Kalatozishvili (s.kalatoz@gmail.com)
+ *
+ * @brief Implementation of high performance event based non-blocking HTTP/S server.
+ * The library will use poll(), epoll() or WSAPoll() depending on the operating system.
+ */
+
+#include "xstd.h"
+#include "xver.h"
+#include "log.h"
+#include "sig.h"
+#include "xfs.h"
+#include "api.h"
+
+#define XHTTP_TIMEOUT_MS    30000  // 30 seconds
+
+static int g_nInterrupted = 0;
+extern char *optarg;
+
+typedef struct {
+    char sCaPath[XPATH_MAX];
+    char sCertPath[XPATH_MAX];
+    char sKeyPath[XPATH_MAX];
+    char sAddr[XSOCK_ADDR_MAX];
+    uint16_t nPort;
+    xbool_t bForce;
+    xbool_t bUnix;
+    xbool_t bSSL;
+} xhttps_args_t;
+
+static void signal_callback(int sig)
+{
+    if (sig == SIGINT) printf("\n");
+    g_nInterrupted = 1;
+}
+
+static int handle_error(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    int nFD = pSession ? (int)pSession->sock.nFD : XSTDERR;
+    int nID = pSession ? (int)pSession->nID : XSTDERR;
+
+    char sStatus[XSTR_MIN];
+    XAPI_DescribeStatus(pCtx, sStatus, sizeof(sStatus));
+
+    xloge("%s: id(%d), fd(%d)", sStatus, nID, nFD);
+
+    return XAPI_CONTINUE;
+}
+
+static int handle_status(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    const char *pStr = XAPI_GetStatus(pCtx);
+    int nFD = pSession ? (int)pSession->sock.nFD : XSTDERR;
+    int nID = pSession ? (int)pSession->nID : XSTDERR;
+    xlogn("%s: id(%d), fd(%d)", pStr, nID, nFD);
+
+    if (pCtx->nStatus == XAPI_DESTROY)
+    {
+        xapi_t *pApi = pCtx->pApi;
+        xhttps_args_t *pArgs = (xhttps_args_t*)pApi->pUserCtx;
+        if (pArgs->bUnix) XPath_Remove(pArgs->sAddr);
+    }
+
+    return XAPI_CONTINUE;
+}
+
+static int handle_request(xapi_session_t *pSession)
+{
+    xhttp_t *pHandle = (xhttp_t*)pSession->pPacket;
+
+    xlogn("Received request: id(%u), fd(%d), buff(%zu)",
+        pSession->nID, (int)pSession->sock.nFD, pHandle->rawData.nUsed);
+
+    char *pHeader = XHTTP_GetHeaderRaw(pHandle);
+    if (pHeader != NULL)
+    {
+        xlogi("Raw request header:\n\n%s", pHeader);
+        free(pHeader);
+    }
+
+    if (pSession->bKeepAlive)
+        XAPI_AddTimer(pSession, XHTTP_TIMEOUT_MS);
+
+    return XAPI_EnableEvent(pSession, XPOLLOUT);
+}
+
+static int handle_complete(xapi_session_t *pSession)
+{
+    xlogi("Response sent to the client: id(%u), fd(%d)",
+        pSession->nID, (int)pSession->sock.nFD);
+
+    if (pSession->bKeepAlive && pSession->pTimer)
+    {
+        XAPI_AddTimer(pSession, XHTTP_TIMEOUT_MS);
+        return XAPI_EnableEvent(pSession, XPOLLIN);
+    }
+
+    return XAPI_DISCONNECT;
+}
+
+static int write_data(xapi_session_t *pSession)
+{
+    xhttp_t handle;
+    if (XHTTP_InitResponse(&handle, 200, NULL) <= 0)
+    {
+        xloge("Failed to initialize HTTP response: %s", XSTRERR);
+        return XAPI_DISCONNECT;
+    }
+
+    if ((pSession->bKeepAlive && XHTTP_AddHeader(&handle, "Connection", "keep-alive") < 0) ||
+        XHTTP_AddHeader(&handle, "Server", "xutils/%s", XUtils_VersionShort()) < 0 ||
+        XHTTP_AddHeader(&handle, "Content-Type", "text/plain") < 0)
+    {
+        xloge("Failed to setup HTTP headers: %s", XSTRERR);
+        XHTTP_Clear(&handle);
+        return XAPI_DISCONNECT;
+    }
+
+    char sBody[XSTR_TINY];
+    size_t nLen = xstrncpy(sBody, sizeof(sBody), "Here is your response.");
+
+    /* The response is written straight into the session's send buffer */
+    xbyte_buffer_t *pTxBuffer = XAPI_GetTxBuff(pSession);
+    xhttp_status_t eStatus = XHTTP_WriteTo(&handle, pTxBuffer, (const uint8_t*)sBody, nLen);
+    XHTTP_Clear(&handle);
+
+    if (eStatus != XHTTP_NONE)
+    {
+        xloge("Failed to assemble HTTP response: %s", XHTTP_GetStatusStr(eStatus));
+        return XAPI_DISCONNECT;
+    }
+
+    xlogn("Sending response: id(%u), fd(%d), buff(%zu)",
+        pSession->nID, (int)pSession->sock.nFD, pTxBuffer->nUsed);
+
+    return XAPI_EnableEvent(pSession, XPOLLOUT);
+}
+
+static int init_data(xapi_session_t *pSession)
+{
+    xlogn("Accepted connection: id(%u), fd(%d)", pSession->nID, (int)pSession->sock.nFD);
+    XAPI_AddTimer(pSession, XHTTP_TIMEOUT_MS);
+    return XAPI_SetEvents(pSession, XPOLLIN);
+}
+
+static int service_callback(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    switch (pCtx->eCbType)
+    {
+        case XAPI_CB_STATUS:
+            return handle_status(pCtx, pSession);
+        case XAPI_CB_ERROR:
+            return handle_error(pCtx, pSession);
+        case XAPI_CB_READ:
+            return handle_request(pSession);
+        case XAPI_CB_WRITE:
+            return write_data(pSession);
+        case XAPI_CB_ACCEPTED:
+            return init_data(pSession);
+        case XAPI_CB_COMPLETE:
+            return handle_complete(pSession);
+        case XAPI_CB_LISTENING:
+            xlogn("Server started listening: id(%u), fd(%d)", pSession->nID, (int)pSession->sock.nFD);
+            return XAPI_CONTINUE;
+        case XAPI_CB_CLOSED:
+            xlogn("Connection closed: id(%u), fd(%d)", pSession->nID, (int)pSession->sock.nFD);
+            return XAPI_CONTINUE;
+        case XAPI_CB_TIMEOUT:
+            xlogn("Timeout event for the socket: id(%u), fd(%d)", pSession->nID, (int)pSession->sock.nFD);
+            return XAPI_DISCONNECT;
+        case XAPI_CB_INTERRUPT:
+            if (g_nInterrupted) return XAPI_DISCONNECT;
+            break;
+        default:
+            break;
+    }
+
+    return XAPI_CONTINUE;
+}
+
+static void display_usage(const char *pName)
+{
+    printf("============================================================\n");
+    printf(" HTTP/S server example - xUtils: %s\n", XUtils_Version());
+    printf("============================================================\n");
+    printf("Usage: %s [options]\n\n", pName);
+    printf("Options are:\n");
+    printf("  -a <addr>            # Listener address (%s*%s)\n", XSTR_CLR_RED, XSTR_FMT_RESET);
+    printf("  -p <port>            # Listener port (%s*%s)\n", XSTR_CLR_RED, XSTR_FMT_RESET);
+    printf("  -c <path>            # SSL Cert file path\n");
+    printf("  -k <path>            # SSL Key file path\n");
+    printf("  -r <path>            # SSL CA file path\n");
+    printf("  -s                   # SSL (WSS) mode\n");
+    printf("  -f                   # Force bind socket\n");
+    printf("  -u                   # Use unix socket\n");
+    printf("  -h                   # Version and usage\n\n");
+}
+
+static xbool_t parse_args(xhttps_args_t *pArgs, int argc, char *argv[])
+{
+    pArgs->sCertPath[0] = XSTR_NUL;
+    pArgs->sKeyPath[0] = XSTR_NUL;
+    pArgs->sCaPath[0] = XSTR_NUL;
+    pArgs->sAddr[0] = XSTR_NUL;
+    pArgs->nPort = XSTDNON;
+    pArgs->bForce = XFALSE;
+    pArgs->bUnix = XFALSE;
+    pArgs->bSSL = XFALSE;
+    int nChar = XSTDNON;
+
+    while ((nChar = getopt(argc, argv, "a:p:c:k:r:f1:u1:s1:h1")) != -1)
+    {
+        switch (nChar)
+        {
+            case 'a':
+                xstrncpy(pArgs->sAddr, sizeof(pArgs->sAddr), optarg);
+                break;
+            case 'c':
+                xstrncpy(pArgs->sCertPath, sizeof(pArgs->sCertPath), optarg);
+                break;
+            case 'k':
+                xstrncpy(pArgs->sKeyPath, sizeof(pArgs->sKeyPath), optarg);
+                break;
+            case 'r':
+                xstrncpy(pArgs->sCaPath, sizeof(pArgs->sCaPath), optarg);
+                break;
+            case 'p':
+                pArgs->nPort = atoi(optarg);
+                break;
+            case 'f':
+                pArgs->bForce = XTRUE;
+                break;
+            case 'u':
+                pArgs->bUnix = XTRUE;
+                break;
+            case 's':
+                pArgs->bSSL = XTRUE;
+                break;
+            case 'h':
+            default:
+                return XFALSE;
+        }
+    }
+
+    if (!xstrused(pArgs->sAddr))
+    {
+        xloge("Missing listener addr");
+        return XFALSE;
+    }
+
+    if (!pArgs->nPort && !pArgs->bUnix)
+    {
+        xloge("Missing listener port");
+        return XFALSE;
+    }
+
+    if (pArgs->bSSL &&
+        (!xstrused(pArgs->sCertPath) ||
+         !xstrused(pArgs->sKeyPath)))
+    {
+        xloge("Missing SSL cert or key path");
+        return XFALSE;
+    }
+
+    return XTRUE;
+}
+
+int main(int argc, char* argv[])
+{
+    xlog_defaults();
+    xlog_timing(XLOG_TIME);
+    xlog_setfl(XLOG_ALL);
+    xlog_indent(XTRUE);
+
+    int nSignals[2] = { SIGTERM, SIGINT };
+    XSig_Register(nSignals, 2, signal_callback);
+
+    xhttps_args_t args;
+    if (!parse_args(&args, argc, argv))
+    {
+        display_usage(argv[0]);
+        return XSTDERR;
+    }
+
+    xapi_t api;
+    XAPI_Init(&api, service_callback, &args);
+
+    xapi_endpoint_t endpt;
+    XAPI_InitEndpoint(&endpt);
+
+    endpt.eType = XAPI_HTTP;
+    endpt.eRole = XAPI_SERVER;
+    endpt.pAddr = args.sAddr;
+    endpt.nPort = args.nPort;
+    endpt.bUnix = args.bUnix;
+    endpt.bTLS = args.bSSL;
+    endpt.bForce = args.bForce;
+
+    if (endpt.bTLS)
+    {
+        endpt.certs.pCaPath = args.sCaPath;
+        endpt.certs.pKeyPath = args.sKeyPath;
+        endpt.certs.pCertPath = args.sCertPath;
+        endpt.certs.nVerifyFlags = XSOCK_VERIFY_PEER;
+    }
+
+    if (XAPI_AddEndpoint(&api, &endpt) < 0)
+    {
+        XAPI_Destroy(&api);
+        return XSTDERR;
+    }
+
+    xevent_status_t status;
+    do status = XAPI_Service(&api, 100);
+    while (status == XEVENTS_SUCCESS);
+
+    XAPI_Destroy(&api);
+    return 0;
+}

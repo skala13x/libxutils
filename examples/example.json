@@ -1,0 +1,38 @@
+{
+    "service": "xutils-gateway",
+    "version": 3,
+    "debug": false,
+    "server": {
+        "address": "0.0.0.0",
+        "port": 8080,
+        "timeout": 2.5,
+        "tls": null
+    },
+    "limits": {
+        "connections": 512,
+        "rate": 120.75,
+        "clockSkew": -30
+    },
+    "routes": [
+        {
+            "path": "/api/users",
+            "methods": ["GET", "POST", "DELETE"],
+            "auth": true,
+            "weight": 0.75
+        },
+        {
+            "path": "/api/status",
+            "methods": ["GET"],
+            "auth": false,
+            "weight": 0.25
+        },
+        {
+            "path": "/static/*",
+            "methods": [],
+            "auth": false,
+            "weight": 1
+        }
+    ],
+    "admins": ["alice", "bob"],
+    "labels": {}
+}
