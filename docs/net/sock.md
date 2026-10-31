@@ -263,6 +263,8 @@ Cross-platform socket wrapper covering TCP, UDP, Unix sockets, socket options an
   - socket with a valid SSL object.
 - Does:
   - performs the SSL connect or accept handshake.
+  - a failed connect keeps the system error of a broken transport, and on a blocking socket that of a timeout
+    that ran out (`XSock_TimeOutR()` / `XSock_TimeOutS()`), the only way TLS can want more there.
 - Returns:
   - fd on success.
   - fd with `eStatus == XSOCK_WANT_READ` or `XSOCK_WANT_WRITE` for non-blocking retry cases.
@@ -531,6 +533,19 @@ Cross-platform socket wrapper covering TCP, UDP, Unix sockets, socket options an
   - socket object, flags and resolved address info.
 - Does:
   - validates the resolved address and port and forwards to `XSock_Create()`.
+- Returns:
+  - fd or `XSOCK_INVALID`.
+
+#### `XSOCKET XSock_OpenTimed(xsock_t *pSock, uint32_t nFlags, xsock_info_t *pAddr, int nTimeoutSec)`
+
+- Arguments:
+  - same as `XSock_Open()`, plus `nTimeoutSec`.
+- Does:
+  - opens like `XSock_Open()`.
+  - for a blocking TCP client and `nTimeoutSec > 0`, gives the connect up after `nTimeoutSec`
+    (`XSOCK_ERR_CONNECT` with `ETIMEDOUT`) and sets the receive and send timeouts to `nTimeoutSec` before the TLS
+    handshake, so neither the connect nor any read or write of the handshake waits longer.
+  - any other socket (non-blocking, Unix, server) and `nTimeoutSec <= 0`: exactly `XSock_Open()`.
 - Returns:
   - fd or `XSOCK_INVALID`.
 

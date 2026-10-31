@@ -4,6 +4,48 @@ set -euo pipefail
 TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-native}"
 if (($#)); then shift; fi
+# Every mode but fuzz, each run by this script exactly as on its own and into its own build directory, streamed and
+# logged; a summary of what passed and failed comes last. The ctest options go to every mode, BUILD_DIR is the root.
+if [[ "$MODE" == full ]]; then
+    FULL_ROOT="${BUILD_DIR:-$TEST_ROOT/build}"
+    FULL_LOGS="$FULL_ROOT/regressions-full"
+    FULL_PASSED=()
+    FULL_FAILED=()
+    FULL_REPORT=()
+    mkdir -p "$FULL_LOGS"
+    trap 'echo; exit 130' INT
+    for FULL_MODE in native no-ssl asan ubsan tsan valgrind coverage; do
+        FULL_LOG="$FULL_LOGS/$FULL_MODE.log"
+        FULL_START=$SECONDS
+        FULL_STATUS=0
+        echo "==== $FULL_MODE ===="
+        BUILD_DIR="$FULL_ROOT/regressions-$FULL_MODE" bash "${BASH_SOURCE[0]}" "$FULL_MODE" "$@" 2>&1 | tee "$FULL_LOG" ||
+            FULL_STATUS=$?
+        FULL_TIME=$((SECONDS - FULL_START))
+        FULL_TIME="$((FULL_TIME / 60))m$((FULL_TIME % 60))s"
+        FULL_RESULT="$(grep -E '^[0-9]+% tests passed' "$FULL_LOG" | tail -n 1 || true)"
+        if ((FULL_STATUS == 0)); then
+            FULL_PASSED+=("$FULL_MODE")
+            FULL_REPORT+=("$(printf 'PASS  %-9s %s (%s)' "$FULL_MODE" "${FULL_RESULT:-done}" "$FULL_TIME")")
+            continue
+        fi
+        FULL_FAILED+=("$FULL_MODE")
+        FULL_REPORT+=("$(printf 'FAIL  %-9s %s (%s, exit %d)' "$FULL_MODE" \
+            "${FULL_RESULT:-stopped before the tests ran, see $FULL_LOG}" "$FULL_TIME" "$FULL_STATUS")")
+        while IFS= read -r FULL_TEST; do
+            FULL_REPORT+=("        $FULL_TEST")
+        done < <(sed -n '/^The following tests FAILED:/,/^Errors while running CTest/p' "$FULL_LOG" |
+            grep -E '^[[:space:]]+[0-9]+ - ' | sed -E 's/^[[:space:]]+//' || true)
+    done
+    $TEST_ROOT/tests/report-coverage.py
+    echo "==== full ===="
+    printf '%s\n' "${FULL_REPORT[@]}"
+    echo "Passed: ${FULL_PASSED[*]:-none}"
+    echo "Failed: ${FULL_FAILED[*]:-none}"
+    echo "Logs:   $FULL_LOGS"
+    ((${#FULL_FAILED[@]} == 0)) || exit 1
+    exit 0
+fi
 TEST_BUILD="${BUILD_DIR:-$TEST_ROOT/build/regressions-$MODE}"
 TEST_JOBS="${JOBS:-4}"
 CMAKE_ARGS=(-S "$TEST_ROOT" -B "$TEST_BUILD" -DXUTILS_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug)
@@ -12,7 +54,7 @@ case "$MODE" in
     ubsan) CMAKE_ARGS+=(-DCMAKE_C_COMPILER="${CC:-gcc}") ;;
     asan|tsan|fuzz) CMAKE_ARGS+=(-DCMAKE_C_COMPILER="${CC:-clang}") ;;
     coverage) CMAKE_ARGS+=(-DCMAKE_C_COMPILER="${CC:-gcc}") ;;
-    *) echo "Usage: $0 {native|no-ssl|asan|ubsan|valgrind|tsan|fuzz|coverage} [ctest options]" >&2; exit 2 ;;
+    *) echo "Usage: $0 {native|no-ssl|asan|ubsan|tsan|fuzz|valgrind|coverage|full} [ctest options]" >&2; exit 2 ;;
 esac
 case "$MODE" in
     no-ssl) CMAKE_ARGS+=(-DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON) ;;

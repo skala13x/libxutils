@@ -81,7 +81,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         -Wl,--wrap=read -Wl,--wrap=write)
     xutils_regression(sys_fault_regression net create nonblock accept api_setup api_timer event_destroy api_destroy
         timer_read read_paths user_actions api_connect ntp_failure worker_rebuild worker_parent worker_limits worker_peak
-        worker_flags wait_failure transfer_errors timer_errors accept_exhausted)
+        worker_flags wait_failure transfer_errors timer_errors accept_exhausted upgrade_events)
     target_link_options(sys_fault_regression PRIVATE -Wl,--wrap=socket -Wl,--wrap=listen -Wl,--wrap=connect
         -Wl,--wrap=setsockopt -Wl,--wrap=fcntl -Wl,--wrap=accept -Wl,--wrap=accept4
         -Wl,--wrap=epoll_create1 -Wl,--wrap=epoll_wait -Wl,--wrap=epoll_ctl -Wl,--wrap=timerfd_create -Wl,--wrap=timerfd_settime
@@ -224,7 +224,7 @@ if(UNIX)
         endif()
     endforeach()
     set_tests_properties(network_feature.concurrent network_feature.concurrent_tls PROPERTIES TIMEOUT 300)
-    xutils_regression(http_client_regression net client_paths connect link_exchange easy_exchange perform
+    xutils_regression(http_client_regression net client_paths connect connect_timeout link_exchange easy_exchange perform
         easy_perform auth_and_status client_failures truncated_answer stream_callback buffered_stream stopped_stream
     terminated_stream content_limit callback_guards length_stream length_buffered
     length_stopped length_terminated length_limit length_truncated)
@@ -234,7 +234,7 @@ if(UNIX)
         tls_close_notify tls_truncated tls_length tls_option)
     xutils_regression(sock_ext_regression net unix_stream force_long_path chunked_transfer nonblocking_accept
         options buffers_and_alloc datagram_options address_accessors flag_guards)
-    xutils_regression(sock_timeout_regression net boundaries)
+    xutils_regression(sock_timeout_regression net boundaries timed_connect timed_handshake)
     xutils_regression(sock_api_regression net null_args stream_errors call_guards address_conversion address_info status_strings
         accessors buffers listener create_guards udp failed_create_state address_port_range option_failures
         connect_refused forced_bind_failure sys_errors)
@@ -255,10 +255,10 @@ xutils_regression(api_http_regression net http_partial http_pipeline http_pipeli
     http_chunked_pipeline http_chunked_invalid auth_key auth_basic auth_short)
 if(UNIX)
     xutils_regression(api_branch_regression net timer_actions buffered_actions tick_actions write_actions complete_actions
-        ws_key_policy ws_token_refusals http_client_ip cancel_ready)
+        ws_key_policy ws_token_refusals http_client_ip cancel_ready handshake_actions)
     xutils_regression(api_ctl_regression net vocabulary init listen_connect endpoint_guards
         timers workers buffers)
-    xutils_regression(api_proto_regression net websocket mdtp http_endpoint timers
+    xutils_regression(api_proto_regression net websocket websocket_full mdtp http_endpoint timers
         status_strings workers worker_affinity)
     xutils_regression(api_events_regression net api_guards event_dispatch peer_reset accept_refused unix_listener
         unknown_type peer_closed peer_hunged user_callback

@@ -489,7 +489,11 @@ CRLF, a size line is at most 4096 bytes and the trailer section at most `XHTTP_H
 - Does:
   - defaults missing protocol to `http`.
   - supports `http`, `https` and Unix-domain sockets via `pHttp->sUnixAddr`.
-  - resolves the host, applies timeout, optionally inserts Basic auth from the link and opens the socket.
+  - resolves the host, optionally inserts Basic auth from the link and opens the socket.
+  - a non-zero `pHttp->nTimeout` (seconds) bounds the connect and every read and write of the TLS handshake through
+    `XSock_OpenTimed()`, then stays the receive and send timeout of the exchange (only the receive timeout over a
+    Unix socket). Set only after the open, as it used to be, it left an unanswered connect to the kernel's retry
+    budget and a silent TLS peer to wait forever.
 - Returns:
   - `XHTTP_CONNECTED` on success.
   - `XHTTP_EPROTO`, `XHTTP_ERESOLVE`, `XHTTP_EAUTH`, `XHTTP_ECONNECT`, `XHTTP_ETIMEO`, etc. on failure.

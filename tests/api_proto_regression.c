@@ -161,10 +161,11 @@ static int ws_callback(xapi_ctx_t *pCtx, xapi_session_t *pSession)
     return XAPI_CONTINUE;
 }
 
-static int XTest_websocket(void)
+/* A WebSocket server and client in one loop: the client's upgrade has to be requested, answered and accepted
+ * before any frame moves. The outgoing request and answer reach their callbacks in either mode, serialized only
+ * with bFullHandshakeCb, and the exchange must come out the same. */
+static int proto_websocket(xbool_t bFullHandshakeCb)
 {
-    /* A WebSocket server and client in one loop: the client's upgrade has
-     * to be requested, answered and accepted before any frame moves. */
     uint16_t nPort = proto_free_port();
     if (!nPort)
     {
@@ -177,6 +178,7 @@ static int XTest_websocket(void)
     test.pClientPayload = "websocket payload";
 
     CHECK(XAPI_Init(&test.api, ws_callback, &test) == XSTDOK, "The API initializes");
+    test.api.bFullHandshakeCb = bFullHandshakeCb;
 
     xapi_endpoint_t server;
     XAPI_InitEndpoint(&server);
@@ -209,9 +211,9 @@ static int XTest_websocket(void)
     for (int i = 0; i < 400 && test.nRead < 2; i++) XAPI_Service(&test.api, 25);
 
     CHECK(test.nAccepted >= 1, "The listener accepted the client");
-    CHECK(test.nHandshakeRequest >= 1, "The server saw the upgrade request");
-    CHECK(test.nHandshakeAnswer >= 1, "The server answered the upgrade");
-    CHECK(test.nHandshakeResponse >= 1, "The client saw the upgrade response");
+    CHECK(test.nHandshakeRequest == 2, "The client's outgoing request and the server's incoming one were both reported");
+    CHECK(test.nHandshakeAnswer == 1, "The server answered the upgrade");
+    CHECK(test.nHandshakeResponse == 1, "The client saw the upgrade response");
     CHECK(test.nRead >= 2, "The frame reached the server and the echo reached the client");
     CHECK(test.nReceivedLen == strlen(test.pClientPayload), "The echoed frame kept its length");
     CHECK(strcmp(test.sReceived, test.pClientPayload) == 0, "The echoed frame kept its payload");
@@ -220,6 +222,9 @@ static int XTest_websocket(void)
     CHECK(test.nClosed >= 1, "Destroying the API closed the sessions");
     return 0;
 }
+
+static int XTest_websocket(void) { return proto_websocket(XFALSE); }
+static int XTest_websocket_full(void) { return proto_websocket(XTRUE); }
 
 /* ---------------- MDTP ---------------- */
 
@@ -871,6 +876,7 @@ static int XTest_worker_affinity(void)
 
 XTEST_MAIN(
     XTEST_CASE(websocket),
+    XTEST_CASE(websocket_full),
     XTEST_CASE(mdtp),
     XTEST_CASE(http_endpoint),
     XTEST_CASE(timers),

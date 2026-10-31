@@ -1257,7 +1257,7 @@ static int XAPI_AnswerUpgrade(xapi_t *pApi, xapi_session_t *pSession)
         XHTTP_AddHeader(&handle, "Connection", "Upgrade") < 0 ||
         XHTTP_AddHeader(&handle, "Sec-WebSocket-Accept", "%s", pSecKey) < 0 ||
         XHTTP_AddHeader(&handle, "Server", "%s", pSession->sUserAgent) < 0 ||
-        XHTTP_Assemble(&handle, NULL, XSTDNON) == NULL)
+        (pApi->bFullHandshakeCb && XHTTP_Assemble(&handle, NULL, XSTDNON) == NULL))
     {
         XAPI_ErrorCb(pApi, pSession, XAPI_SELF, XAPI_ERR_ASSEMBLE);
         XHTTP_Clear(&handle);
@@ -1273,17 +1273,46 @@ static int XAPI_AnswerUpgrade(xapi_t *pApi, xapi_session_t *pSession)
     nStatus = XAPI_ServiceCb(pApi, pSession, XAPI_CB_HANDSHAKE_ANSWER);
     int nRetVal = XAPI_StatusToEvent(pApi, nStatus);
 
-    XAPI_PutTxBuff(pSession, &handle.rawData);
-    xbyte_buffer_t *pBuffer = &pSession->txBuffer;
+    if (nRetVal == XEVENTS_DISCONNECT)
+    {
+        XHTTP_Clear(&handle);
+        pSession->pPacket = NULL;
+        pSession->bCancel = XTRUE;
+        return XEVENTS_DISCONNECT;
+    }
+    else if (pApi->bFullHandshakeCb)
+    {
+        if (XAPI_PutTxBuff(pSession, &handle.rawData) != XSTDOK)
+        {
+            XHTTP_Clear(&handle);
+            pSession->pPacket = NULL;
+            pSession->bCancel = XTRUE;
+            return XEVENTS_DISCONNECT;
+        }
+    }
+    else if (XHTTP_WriteTo(&handle, &pSession->txBuffer, NULL, XSTDNON) != XHTTP_NONE)
+    {
+        XAPI_ErrorCb(pApi, pSession, XAPI_SELF, XAPI_ERR_ASSEMBLE);
+        XHTTP_Clear(&handle);
+        pSession->pPacket = NULL;
+        pSession->bCancel = XTRUE;
+        return XEVENTS_DISCONNECT;
+    }
 
     XHTTP_Clear(&handle);
     pSession->pPacket = NULL;
 
-    if (nRetVal != XEVENTS_CONTINUE) return nRetVal;
-    else if (!pBuffer->nUsed) return XEVENTS_DISCONNECT;
+    if (!pSession->txBuffer.nUsed)
+    {
+        pSession->bCancel = XTRUE;
+        return XEVENTS_DISCONNECT;
+    }
 
     nStatus = XAPI_EnableEvent(pSession, XPOLLOUT);
-    return XAPI_StatusToEvent(pApi, (int)nStatus);
+    int nEventRet = XAPI_StatusToEvent(pApi, (int)nStatus);
+    if (nEventRet != XEVENTS_CONTINUE) return nEventRet;
+
+    return nRetVal;
 }
 
 static int XAPI_RequestUpgrade(xapi_t *pApi, xapi_session_t *pSession)
@@ -1326,7 +1355,7 @@ static int XAPI_RequestUpgrade(xapi_t *pApi, xapi_session_t *pSession)
         XHTTP_AddHeader(&handle, "Sec-WebSocket-Key", "%s", pSession->sKey) < 0 ||
         XHTTP_AddHeader(&handle, "User-Agent", "%s", pSession->sUserAgent) < 0 ||
         XHTTP_AddHeader(&handle, "Host", "%s", sHost) < 0 ||
-        XHTTP_Assemble(&handle, NULL, XSTDNON) == NULL)
+        (pApi->bFullHandshakeCb && XHTTP_Assemble(&handle, NULL, XSTDNON) == NULL))
     {
         XAPI_ErrorCb(pApi, pSession, XAPI_SELF, XAPI_ERR_ASSEMBLE);
         XHTTP_Clear(&handle);
@@ -1341,17 +1370,46 @@ static int XAPI_RequestUpgrade(xapi_t *pApi, xapi_session_t *pSession)
     nStatus = XAPI_ServiceCb(pApi, pSession, XAPI_CB_HANDSHAKE_REQUEST);
     int nRetVal = XAPI_StatusToEvent(pApi, nStatus);
 
-    XAPI_PutTxBuff(pSession, &handle.rawData);
-    xbyte_buffer_t *pBuffer = &pSession->txBuffer;
+    if (nRetVal == XEVENTS_DISCONNECT)
+    {
+        XHTTP_Clear(&handle);
+        pSession->pPacket = NULL;
+        pSession->bCancel = XTRUE;
+        return XEVENTS_DISCONNECT;
+    }
+    else if (pApi->bFullHandshakeCb)
+    {
+        if (XAPI_PutTxBuff(pSession, &handle.rawData) != XSTDOK)
+        {
+            XHTTP_Clear(&handle);
+            pSession->pPacket = NULL;
+            pSession->bCancel = XTRUE;
+            return XEVENTS_DISCONNECT;
+        }
+    }
+    else if (XHTTP_WriteTo(&handle, &pSession->txBuffer, NULL, XSTDNON) != XHTTP_NONE)
+    {
+        XAPI_ErrorCb(pApi, pSession, XAPI_SELF, XAPI_ERR_ASSEMBLE);
+        XHTTP_Clear(&handle);
+        pSession->pPacket = NULL;
+        pSession->bCancel = XTRUE;
+        return XEVENTS_DISCONNECT;
+    }
 
     XHTTP_Clear(&handle);
     pSession->pPacket = NULL;
 
-    if (nRetVal != XEVENTS_CONTINUE) return nRetVal;
-    else if (!pBuffer->nUsed) return XEVENTS_DISCONNECT;
+    if (!pSession->txBuffer.nUsed)
+    {
+        pSession->bCancel = XTRUE;
+        return XEVENTS_DISCONNECT;
+    }
 
     nStatus = XAPI_EnableEvent(pSession, XPOLLOUT);
-    return XAPI_StatusToEvent(pApi, (int)nStatus);
+    int nEventRet = XAPI_StatusToEvent(pApi, (int)nStatus);
+    if (nEventRet != XEVENTS_CONTINUE) return nEventRet;
+
+    return nRetVal;
 }
 
 /* Whether parsing the pending handshake request could give a different answer than last time. Parsing searches for
@@ -2358,6 +2416,7 @@ XSTATUS XAPI_Init(xapi_t *pApi, xapi_cb_t callback, void *pUserCtx)
 {
     XCHECK((pApi != NULL), XSTDINV);
     pApi->nSessionCounter = XSTDNON;
+    pApi->bFullHandshakeCb = XFALSE;
     pApi->bAllowMissingKey = XFALSE;
     pApi->bHaveEvents = XFALSE;
     pApi->bUseHashMap = XTRUE;

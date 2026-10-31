@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <signal.h>
 #include <limits.h>
+#include <locale.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <errno.h>

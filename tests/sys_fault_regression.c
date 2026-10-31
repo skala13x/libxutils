@@ -1110,7 +1110,95 @@ static int XTest_accept_exhausted(void)
     return 0;
 }
 
+typedef struct {
+    int nRequests;
+    int nAnswers;
+    int nErrors;
+    int nSysError;
+    int nClosed;
+    xbool_t bDisabled;
+    xapi_session_t *pSession;
+} fault_ws_t;
+
+static int fault_ws_cb(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    fault_ws_t *pTest = pCtx->pApi->pUserCtx;
+    if (pCtx->eCbType == XAPI_CB_REGISTERED) pTest->pSession = pSession;
+    if (pCtx->eCbType == XAPI_CB_ERROR) { pTest->nErrors++; pTest->nSysError = pCtx->nSysError; }
+    if (pCtx->eCbType == XAPI_CB_CLOSED) { pTest->pSession = NULL; pTest->nClosed++; }
+    if (pCtx->eCbType == XAPI_CB_HANDSHAKE_ANSWER) pTest->nAnswers++;
+    if (pCtx->eCbType == XAPI_CB_HANDSHAKE_REQUEST && pSession->eRole == XAPI_CLIENT)
+    {
+        /* A client is writable when it upgrades, so queuing the request needs no epoll call unless the callback took
+           write interest away. Taking it away here is what makes the request's own epoll call the one that fails. */
+        pTest->nRequests++;
+        if (XAPI_DisableEvent(pSession, XPOLLOUT) != XSTDOK) return XAPI_DISCONNECT;
+        pTest->bDisabled = XTRUE;
+    }
+    return XAPI_CONTINUE;
+}
+
+static int XTest_upgrade_events(void)
+{
+    /* The upgrade request or answer is queued, then write interest is enabled for it. When that epoll call fails the
+       message cannot go out: the failure is reported once with its error and the session is closed, whether the
+       message was serialized before the callback or written out after it. */
+    const char request[] = "GET /socket HTTP/1.1\r\nHost: example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    for (int bServer = 0; bServer < 2; bServer++)
+    {
+        for (int bFull = 0; bFull < 2; bFull++)
+        {
+            xapi_t api;
+            fault_ws_t test = {0};
+            int pair[2];
+            CHECK(XAPI_Init(&api, fault_ws_cb, &test) == XSTDOK && socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0,
+                "Create a WebSocket endpoint on a private transport");
+            api.bFullHandshakeCb = bFull;
+
+            xapi_endpoint_t endpoint;
+            XAPI_InitEndpoint(&endpoint);
+            endpoint.eType = XAPI_WS;
+            endpoint.eRole = bServer ? XAPI_PEER : XAPI_CLIENT;
+            endpoint.nEvents = bServer ? XPOLLIN : XPOLLOUT;
+            endpoint.nPort = 4321;
+            endpoint.pUri = "/socket";
+            endpoint.nFD = pair[0];
+            CHECK(XAPI_AddEvent(&api, &endpoint) == XSTDOK && test.pSession, "Register the WebSocket endpoint");
+            strcpy(test.pSession->sAddr, "example.test");
+            CHECK(XSock_NonBlock(&test.pSession->sock, XTRUE) >= 0, "Upgrade writes cannot block");
+            api.events.nEventMax = 4;
+            if (bServer)
+                CHECK(send(pair[1], request, sizeof(request) - 1, 0) == (ssize_t)(sizeof(request) - 1), "Send the request");
+
+            /* The client's own DisableEvent() is the first modification; the one after it is the failure */
+            g_nOperation = EPOLL_CTL_MOD;
+            g_nSkip = bServer ? 0 : 1;
+            fault_arm(FAULT_CONTROL);
+            CHECK(XAPI_Service(&api, 100) == XEVENTS_SUCCESS, "A failed upgrade stays contained to its session");
+            int nHits = g_nHits;
+            fault_arm(FAULT_NONE);
+            g_nSkip = 0;
+
+            uint8_t wire[512];
+            ssize_t nRead = recv(pair[1], wire, sizeof(wire), MSG_DONTWAIT);
+            CHECK((bServer ? test.nAnswers : test.nRequests) == 1, "The outgoing callback ran before the failure");
+            CHECK(bServer || test.bDisabled, "The client's callback took write interest away, so the failure is the one after");
+            CHECK(nHits == 1 && test.nErrors == 1 && test.nSysError == EIO,
+                "The failure to enable write interest is reported once, with the error of epoll_ctl()");
+            CHECK(test.nClosed == 1 && !test.pSession && nRead == 0, "The session is closed with nothing sent");
+
+            XAPI_Destroy(&api);
+            close(pair[1]);
+            CHECK(test.nClosed == 1, "The closed session is not closed again");
+        }
+    }
+    return 0;
+}
+
 XTEST_MAIN(
+    XTEST_CASE(upgrade_events),
     XTEST_CASE(transfer_errors),
     XTEST_CASE(timer_errors),
     XTEST_CASE(accept_exhausted),

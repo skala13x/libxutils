@@ -200,6 +200,7 @@ struct xapi_ {
     int nWorkerIndex;
     int nCoreIndex;
 
+    xbool_t bFullHandshakeCb;
     xbool_t bAllowMissingKey;
     xbool_t bHaveEvents;
     xbool_t bUseHashMap;

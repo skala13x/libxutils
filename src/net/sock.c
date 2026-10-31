@@ -21,6 +21,11 @@ typedef SSIZE_T ssize_t;
 #include "sync.h"
 #include "str.h"
 #include "xfs.h"
+#include "xtime.h"
+
+#ifndef _WIN32
+#include <poll.h>
+#endif
 
 /*
   S.K. >> Note:
@@ -44,11 +49,15 @@ typedef SSIZE_T ssize_t;
 #define XSOCK_WOULDBLOCK(err) ((err) == WSAEWOULDBLOCK)
 #define XSOCK_ACCEPT_AGAIN(err) ((err) == WSAEWOULDBLOCK || (err) == WSAECONNABORTED)
 #define XSOCK_INTERRUPTED(err) (XFALSE)
+#define XSOCK_CONNECTING(err) ((err) == WSAEWOULDBLOCK)
+#define XSOCK_ETIMEDOUT WSAETIMEDOUT
 #else
 #define XSOCK_ERRNO() errno
 #define XSOCK_WOULDBLOCK(err) ((err) == EAGAIN || (err) == EWOULDBLOCK)
 #define XSOCK_ACCEPT_AGAIN(err) ((err) == EAGAIN || (err) == EWOULDBLOCK || (err) == ECONNABORTED)
 #define XSOCK_INTERRUPTED(err) ((err) == EINTR)
+#define XSOCK_CONNECTING(err) ((err) == EINPROGRESS || (err) == EINTR)
+#define XSOCK_ETIMEDOUT ETIMEDOUT
 #endif
 
 /*
@@ -2354,8 +2363,13 @@ XSOCKET XSock_SSLConnect(xsock_t *pSock)
         }
 
         /* SSL_ERROR_SYSCALL is a failed transport and errno has its error,
-           taken before restoring the signal mask, which can change it */
-        XSock_SetSysError(pSock, XSOCK_ERR_SSLCNT, nError == SSL_ERROR_SYSCALL ? nSysError : 0);
+           taken before restoring the signal mask, which can change it. So
+           is a blocking socket that wants more: only its timeout runs out. */
+        xbool_t bTransport = nError == SSL_ERROR_SYSCALL ||
+                             nError == SSL_ERROR_WANT_READ ||
+                             nError == SSL_ERROR_WANT_WRITE;
+
+        XSock_SetSysError(pSock, XSOCK_ERR_SSLCNT, bTransport ? nSysError : 0);
         XSock_Close(pSock);
         return XSOCK_INVALID;
     }
@@ -2620,7 +2634,81 @@ static xbool_t XSock_ConnectPending(const xsock_t *pSock)
 #endif
 }
 
-static XSOCKET XSock_SetupStream(xsock_t *pSock, const char *pAddr, size_t nFdMax)
+/* Waits for a connect() that did not finish at once: > 0 once it is decided either way, 0 when nTimeoutMs ran
+   out first, < 0 when the wait itself failed. Windows reports a refused connect only through the except set. */
+static int XSock_WaitConnect(XSOCKET nFD, int nTimeoutMs)
+{
+#ifdef _WIN32
+    fd_set writeSet, exceptSet;
+    FD_ZERO(&writeSet);
+    FD_ZERO(&exceptSet);
+    FD_SET(nFD, &writeSet);
+    FD_SET(nFD, &exceptSet);
+
+    struct timeval tmout;
+    tmout.tv_sec = nTimeoutMs / 1000;
+    tmout.tv_usec = (nTimeoutMs % 1000) * 1000;
+    return select(0, NULL, &writeSet, &exceptSet, &tmout);
+#else
+    /* poll() and not select(): a busy process hands out descriptors past FD_SETSIZE */
+    uint64_t nDeadlineMs = XTime_GetMonoMs() + (uint64_t)nTimeoutMs;
+    struct pollfd pollFd;
+    pollFd.fd = nFD;
+    pollFd.events = POLLOUT;
+
+    for (;;)
+    {
+        pollFd.revents = 0;
+        int nReady = poll(&pollFd, 1, nTimeoutMs);
+        if (nReady >= 0 || errno != EINTR) return nReady;
+
+        /* A signal cuts the wait short, and what is left of it still applies */
+        uint64_t nNowMs = XTime_GetMonoMs();
+        if (nNowMs >= nDeadlineMs) return 0;
+        nTimeoutMs = (int)(nDeadlineMs - nNowMs);
+    }
+#endif
+}
+
+/* A blocking client's connect() given up after nTimeoutSec: started without blocking, waited for, then
+   made blocking again. Left to the kernel, an address that never answers holds the caller for its whole
+   SYN retry budget, about two minutes on Linux, and SO_SNDTIMEO does not shorten that on every platform. */
+static XSOCKET XSock_ConnectTimed(xsock_t *pSock, int nTimeoutSec)
+{
+    xsockaddr_t* pSockAddr = XSock_GetSockAddr(pSock);
+    xsocklen_t nAddrLen = XSock_GetAddrLen(pSock);
+    if (XSock_NonBlock(pSock, XTRUE) == XSOCK_INVALID) return XSOCK_INVALID;
+
+    if (connect(pSock->nFD, pSockAddr, nAddrLen) < 0)
+    {
+        int nError = XSOCK_ERRNO();
+        if (!XSOCK_CONNECTING(nError))
+        {
+            XSock_SetSysError(pSock, XSOCK_ERR_CONNECT, nError);
+            XSock_Close(pSock);
+            return XSOCK_INVALID;
+        }
+
+        int nTimeoutMs = nTimeoutSec > INT_MAX / 1000 ? INT_MAX : nTimeoutSec * 1000;
+        int nReady = XSock_WaitConnect(pSock->nFD, nTimeoutMs);
+        xsocklen_t nLen = (xsocklen_t)sizeof(nError);
+
+        if (nReady < 0) nError = XSOCK_ERRNO();
+        else if (!nReady) nError = XSOCK_ETIMEDOUT;
+        else if (getsockopt(pSock->nFD, SOL_SOCKET, SO_ERROR, (char*)&nError, &nLen) < 0) nError = XSOCK_ERRNO();
+
+        if (nError)
+        {
+            XSock_SetSysError(pSock, XSOCK_ERR_CONNECT, nError);
+            XSock_Close(pSock);
+            return XSOCK_INVALID;
+        }
+    }
+
+    return XSock_NonBlock(pSock, XFALSE);
+}
+
+static XSOCKET XSock_SetupStream(xsock_t *pSock, const char *pAddr, size_t nFdMax, int nTimeoutSec)
 {
     if (!XSock_Check(pSock)) return XSOCK_INVALID;
 
@@ -2644,7 +2732,14 @@ static XSOCKET XSock_SetupStream(xsock_t *pSock, const char *pAddr, size_t nFdMa
         xsockaddr_t* pSockAddr = XSock_GetSockAddr(pSock);
         xsocklen_t nAddrLen = XSock_GetAddrLen(pSock);
 
-        if (connect(pSock->nFD, pSockAddr, nAddrLen) < 0 && !XSock_ConnectPending(pSock))
+        if (nTimeoutSec > 0 && !XSock_IsNB(pSock) && !XFLAGS_CHECK(pSock->nFlags, XSOCK_UNIX))
+        {
+            /* Set before the handshake below, so that each of its reads and writes is bounded as well */
+            if (XSock_TimeOutR(pSock, nTimeoutSec, XSTDNON) == XSOCK_INVALID ||
+                XSock_TimeOutS(pSock, nTimeoutSec, XSTDNON) == XSOCK_INVALID ||
+                XSock_ConnectTimed(pSock, nTimeoutSec) == XSOCK_INVALID) return XSOCK_INVALID;
+        }
+        else if (connect(pSock->nFD, pSockAddr, nAddrLen) < 0 && !XSock_ConnectPending(pSock))
         {
             XSock_SetSysError(pSock, XSOCK_ERR_CONNECT, XSOCK_ERRNO());
             XSock_Close(pSock);
@@ -2734,7 +2829,8 @@ static int XSock_SetupAddr(xsock_t *pSock, const char *pAddr, uint16_t nPort)
     return XSTDOK;
 }
 
-XSOCKET XSock_CreateAdv(xsock_t *pSock, uint32_t nFlags, size_t nFdMax, const char *pAddr, uint16_t nPort, const char *pName)
+static XSOCKET XSock_CreateCommon(xsock_t *pSock, uint32_t nFlags, size_t nFdMax, const char *pAddr,
+                                  uint16_t nPort, const char *pName, int nTimeoutSec)
 {
     XSTATUS nStatus = XSock_Init(pSock, nFlags, XSOCK_INVALID);
     if (nStatus == XSOCK_ERROR) return XSOCK_INVALID;
@@ -2786,7 +2882,7 @@ XSOCKET XSock_CreateAdv(xsock_t *pSock, uint32_t nFlags, size_t nFdMax, const ch
         (XFLAGS_CHECK(nFlags, XSOCK_UNIX) || XFLAGS_CHECK(nFlags, XSOCK_ASYNC)) &&
         XSock_NonBlock(pSock, XTRUE) == XSOCK_INVALID) return XSOCK_INVALID;
 
-    if (pSock->nType == SOCK_STREAM) XSock_SetupStream(pSock, pAddr, nFdMax);
+    if (pSock->nType == SOCK_STREAM) XSock_SetupStream(pSock, pAddr, nFdMax, nTimeoutSec);
     else if (pSock->nType == SOCK_DGRAM) XSock_SetupDgram(pSock, bReuseAddr);
 
     if (XFLAGS_CHECK(pSock->nFlags, XSOCK_NB))
@@ -2795,9 +2891,14 @@ XSOCKET XSock_CreateAdv(xsock_t *pSock, uint32_t nFlags, size_t nFdMax, const ch
     return pSock->nFD;
 }
 
+XSOCKET XSock_CreateAdv(xsock_t *pSock, uint32_t nFlags, size_t nFdMax, const char *pAddr, uint16_t nPort, const char *pName)
+{
+    return XSock_CreateCommon(pSock, nFlags, nFdMax, pAddr, nPort, pName, XSTDNON);
+}
+
 XSOCKET XSock_Create(xsock_t *pSock, uint32_t nFlags, const char *pAddr, uint16_t nPort)
 {
-    return XSock_CreateAdv(pSock, nFlags, 0, pAddr, nPort, NULL);
+    return XSock_CreateAdv(pSock, nFlags, XSTDNON, pAddr, nPort, NULL);
 }
 
 XSOCKET XSock_Open(xsock_t *pSock, uint32_t nFlags, xsock_info_t *pAddr)
@@ -2811,6 +2912,19 @@ XSOCKET XSock_Open(xsock_t *pSock, uint32_t nFlags, xsock_info_t *pAddr)
     }
 
     return XSock_CreateAdv(pSock, nFlags, 0, pAddr->sAddr, pAddr->nPort, pAddr->sName);
+}
+
+XSOCKET XSock_OpenTimed(xsock_t *pSock, uint32_t nFlags, xsock_info_t *pAddr, int nTimeoutSec)
+{
+    XCHECK_NL((pSock != NULL), XSOCK_INVALID);
+    if (pAddr == NULL || !xstrused(pAddr->sAddr) || (!pAddr->nPort && !XFLAGS_CHECK(nFlags, XSOCK_UNIX)))
+    {
+        XSock_Init(pSock, XSOCK_UNDEFINED, XSOCK_INVALID);
+        XSock_SetStatus(pSock, XSOCK_ERR_ARGS);
+        return XSOCK_INVALID;
+    }
+
+    return XSock_CreateCommon(pSock, nFlags, 0, pAddr->sAddr, pAddr->nPort, pAddr->sName, nTimeoutSec);
 }
 
 XSOCKET XSock_Setup(xsock_t *pSock, uint32_t nFlags, const char *pAddr)

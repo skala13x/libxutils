@@ -1865,7 +1865,8 @@ xhttp_status_t XHTTP_Connect(xhttp_t *pHttp, xsock_t *pSock, xlink_t *pLink)
         pHttp->callback(pHttp, &cbCtx);
     }
 
-    if (XSock_Open(pSock, nFlags, &addrInfo) == XSOCK_INVALID)
+    /* The timeout bounds the connect and the TLS handshake as well, not only the reads that follow them */
+    if (XSock_OpenTimed(pSock, nFlags, &addrInfo, (int)pHttp->nTimeout) == XSOCK_INVALID)
         return XHTTP_StatusCb(pHttp, XHTTP_ECONNECT);
 
     if (pHttp->nTimeout)

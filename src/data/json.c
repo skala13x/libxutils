@@ -15,7 +15,6 @@
 #include "json.h"
 #include "str.h"
 #include "map.h"
-#include <locale.h>
 
 #define XOBJ_INITIAL_SIZE   2
 #define XJSON_IDENT_INC     1

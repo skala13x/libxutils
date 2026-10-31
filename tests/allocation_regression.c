@@ -854,71 +854,93 @@ static int XTest_http_copy_failure(void)
 
 static int XTest_ws_request_failure(void)
 {
-    size_t nFailures = 0;
-    for (int nDefaultPort = 0; nDefaultPort < 2; nDefaultPort++)
+    /* Both ways the request reaches its callback - serialized first (bFullHandshakeCb) or written out after it - and
+       headers long enough to outgrow the handle's initial storage, so serializing them has to allocate too. */
+    char sLongUri[1900];
+    char sLongAgent[2040];
+    memcpy(sLongUri, "/socket?exact=", 14);
+    memset(sLongUri + 14, 'u', sizeof(sLongUri) - 15);
+    sLongUri[sizeof(sLongUri) - 1] = '\0';
+    memset(sLongAgent, 'a', sizeof(sLongAgent) - 1);
+    sLongAgent[sizeof(sLongAgent) - 1] = '\0';
+
+    for (int nMode = 0; nMode < 4; nMode++)
     {
-        size_t nAllocations = 0;
-        for (size_t i = 0; i <= nAllocations; i++)
+        xbool_t bFull = (nMode & 1) ? XTRUE : XFALSE;
+        xbool_t bLong = (nMode & 2) ? XTRUE : XFALSE;
+        const char *pUri = bLong ? sLongUri : "/socket?exact=1";
+        const char *pAgent = bLong ? sLongAgent : "allocation-test";
+        size_t nFailures = 0;
+
+        for (int nDefaultPort = 0; nDefaultPort < 2; nDefaultPort++)
         {
-            alloc_ws_t test = {0};
-            xapi_t api;
-            int pair[2];
-            CHECK(XAPI_Init(&api, alloc_ws_callback, &test) == XSTDOK && !socketpair(AF_UNIX, SOCK_STREAM, 0, pair),
-                "Create a websocket client before injecting failures");
-            xapi_endpoint_t endpoint;
-            XAPI_InitEndpoint(&endpoint);
-            endpoint.eType = XAPI_WS;
-            endpoint.eRole = XAPI_CLIENT;
-            endpoint.nEvents = XPOLLOUT;
-            endpoint.nPort = nDefaultPort ? 80 : 4321;
-            endpoint.pUri = "/socket?exact=1";
-            endpoint.nFD = pair[0];
-            CHECK(XAPI_AddEvent(&api, &endpoint) == XSTDOK && test.pSession, "Register the websocket client");
-            strcpy(test.pSession->sAddr, "example.test");
-            strcpy(test.pSession->sUserAgent, "allocation-test");
-            CHECK(XSock_NonBlock(&test.pSession->sock, XTRUE) >= 0, "Handshake writes cannot block");
-            api.events.nEventMax = 4;
-            g_nCalls = 0;
-            g_nFailAt = i ? i : SIZE_MAX;
-            int nStatus = XAPI_Service(&api, 100);
-            g_nFailAt = 0;
-            if (!i) nAllocations = g_nCalls;
-            CHECK(nStatus == XEVENTS_SUCCESS, "Handshake failures are contained to their session");
-            uint8_t wire[4096];
-            ssize_t nRead = recv(pair[1], wire, sizeof(wire), MSG_DONTWAIT);
-            if (test.nClosed)
+            size_t nAllocations = 0;
+            for (size_t i = 0; i <= nAllocations; i++)
             {
-                nFailures++;
-                CHECK(i && test.nClosed == 1 && !test.pSession && nRead == 0 && test.nErrors,
-                    "Failed handshake allocations close the client without transmitting a partial HTTP request");
-            }
-            else
-            {
-                xhttp_t request;
-                CHECK(nRead > 0 && XHTTP_ParseData(&request, wire, nRead) == XHTTP_COMPLETE,
-                    "A successful client sends a complete HTTP upgrade request");
-                CHECK(request.eType == XHTTP_REQUEST && request.eMethod == XHTTP_GET &&
-                    !strcmp(request.sUri, "/socket?exact=1") && !strcmp(request.sVersion, "1.1") && !XHTTP_GetBodySize(&request),
-                    "Every successful request preserves its exact method, URI, version and empty body");
-                const char *pNames[] = {"Upgrade", "Connection", "Sec-WebSocket-Version", "User-Agent", "Host",
-                    "Sec-WebSocket-Key"};
-                const char *pValues[] = {"websocket", "Upgrade", "13", "allocation-test",
-                    nDefaultPort ? "example.test" : "example.test:4321", test.pSession->sKey};
-                for (size_t j = 0; j < sizeof(pNames) / sizeof(*pNames); j++)
+                alloc_ws_t test = {0};
+                xapi_t api;
+                int pair[2];
+                CHECK(XAPI_Init(&api, alloc_ws_callback, &test) == XSTDOK && !socketpair(AF_UNIX, SOCK_STREAM, 0, pair),
+                    "Create a websocket client before injecting failures");
+                api.bFullHandshakeCb = bFull;
+                xapi_endpoint_t endpoint;
+                XAPI_InitEndpoint(&endpoint);
+                endpoint.eType = XAPI_WS;
+                endpoint.eRole = XAPI_CLIENT;
+                endpoint.nEvents = XPOLLOUT;
+                endpoint.nPort = nDefaultPort ? 80 : 4321;
+                endpoint.pUri = pUri;
+                endpoint.nFD = pair[0];
+                CHECK(XAPI_AddEvent(&api, &endpoint) == XSTDOK && test.pSession, "Register the websocket client");
+                strcpy(test.pSession->sAddr, "example.test");
+                xstrncpy(test.pSession->sUserAgent, sizeof(test.pSession->sUserAgent), pAgent);
+                CHECK(XSock_NonBlock(&test.pSession->sock, XTRUE) >= 0, "Handshake writes cannot block");
+                api.events.nEventMax = 4;
+                g_nCalls = 0;
+                g_nFailAt = i ? i : SIZE_MAX;
+                int nStatus = XAPI_Service(&api, 100);
+                g_nFailAt = 0;
+                if (!i) nAllocations = g_nCalls;
+                CHECK(nStatus == XEVENTS_SUCCESS, "Handshake failures are contained to their session");
+                uint8_t wire[8192];
+                ssize_t nRead = recv(pair[1], wire, sizeof(wire), MSG_DONTWAIT);
+                if (test.nClosed)
                 {
-                    const char *pValue = XHTTP_GetHeader(&request, pNames[j]);
-                    CHECK(pValue && !strcmp(pValue, pValues[j]), "Every upgrade header has its intended exact value");
+                    nFailures++;
+                    CHECK(i && test.nClosed == 1 && !test.pSession && nRead == 0 && test.nErrors,
+                        "Failed handshake allocations close the client without transmitting a partial HTTP request");
                 }
-                CHECK(strlen(test.pSession->sKey) == 24 && test.pSession->bHandshakeStart && !test.pSession->bHandshakeDone &&
-                    !test.nErrors && !test.pSession->txBuffer.nUsed, "The client awaits an answer after sending a valid nonce");
-                XHTTP_Clear(&request);
+                else
+                {
+                    xhttp_t request;
+                    CHECK(nRead > 0 && XHTTP_ParseData(&request, wire, nRead) == XHTTP_COMPLETE,
+                        "A successful client sends a complete HTTP upgrade request");
+                    CHECK(request.eType == XHTTP_REQUEST && request.eMethod == XHTTP_GET && !strcmp(request.sUri, pUri) &&
+                        !strcmp(request.sVersion, "1.1") && !XHTTP_GetBodySize(&request),
+                        "Every successful request preserves its exact method, URI, version and empty body");
+                    const char *pNames[] = {"Upgrade", "Connection", "Sec-WebSocket-Version", "User-Agent", "Host",
+                        "Sec-WebSocket-Key"};
+                    const char *pValues[] = {"websocket", "Upgrade", "13", pAgent,
+                        nDefaultPort ? "example.test" : "example.test:4321", test.pSession->sKey};
+                    for (size_t j = 0; j < sizeof(pNames) / sizeof(*pNames); j++)
+                    {
+                        const char *pValue = XHTTP_GetHeader(&request, pNames[j]);
+                        CHECK(pValue && !strcmp(pValue, pValues[j]), "Every upgrade header has its intended exact value");
+                    }
+                    CHECK(strlen(test.pSession->sKey) == 24 && test.pSession->bHandshakeStart &&
+                        !test.pSession->bHandshakeDone && !test.nErrors && !test.pSession->txBuffer.nUsed,
+                        "The client awaits an answer after sending a valid nonce");
+                    XHTTP_Clear(&request);
+                }
+                XAPI_Destroy(&api);
+                close(pair[1]);
+                CHECK(test.nClosed == 1 && fcntl(pair[0], F_GETFD) < 0 && errno == EBADF,
+                    "Every client descriptor is released once");
             }
-            XAPI_Destroy(&api);
-            close(pair[1]);
-            CHECK(test.nClosed == 1 && fcntl(pair[0], F_GETFD) < 0 && errno == EBADF, "Every client descriptor is released once");
         }
+        CHECK(nFailures > 20,
+            "Fail request initialization, nonce encoding, headers, serialization and transmit-buffer allocations");
     }
-    CHECK(nFailures > 20, "Fail request initialization, nonce encoding, headers, assembly and transmit-buffer allocations");
     return 0;
 }
 
@@ -926,65 +948,71 @@ static int XTest_ws_answer_failure(void)
 {
     const char request[] = "GET /socket HTTP/1.1\r\nHost: example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-    size_t nAllocations = 0, nFailures = 0;
-    for (size_t i = 0; i <= nAllocations; i++)
+    /* Serialized before the answer callback (bFullHandshakeCb) or written out after it */
+    for (int bFull = 0; bFull < 2; bFull++)
     {
-        alloc_ws_t test = {0};
-        xapi_t api;
-        int pair[2];
-        CHECK(XAPI_Init(&api, alloc_ws_callback, &test) == XSTDOK && !socketpair(AF_UNIX, SOCK_STREAM, 0, pair),
-            "Create a websocket server before injecting failures");
-        xapi_endpoint_t endpoint;
-        XAPI_InitEndpoint(&endpoint);
-        endpoint.eType = XAPI_WS;
-        endpoint.eRole = XAPI_PEER;
-        endpoint.nEvents = XPOLLIN;
-        endpoint.nFD = pair[0];
-        CHECK(XAPI_AddEvent(&api, &endpoint) == XSTDOK && test.pSession, "Register the accepted websocket transport");
-        strcpy(test.pSession->sUserAgent, "allocation-server");
-        CHECK(XSock_NonBlock(&test.pSession->sock, XTRUE) >= 0 &&
-            XByteBuffer_Add(&test.pSession->rxBuffer, (const uint8_t*)request, sizeof(request) - 1) == sizeof(request) - 1,
-            "Provide the complete known upgrade request before failing allocations");
-        api.events.nEventMax = 4;
-        g_nCalls = 0;
-        g_nFailAt = i ? i : SIZE_MAX;
-        int nStatus = XAPI_ProcessBuffered(test.pSession);
-        g_nFailAt = 0;
-        if (!i) nAllocations = g_nCalls;
-        if (nStatus == XAPI_CONTINUE)
+        size_t nAllocations = 0, nFailures = 0;
+        for (size_t i = 0; i <= nAllocations; i++)
         {
-            CHECK(test.pSession->txBuffer.nUsed && !test.pSession->rxBuffer.nUsed && !test.nErrors &&
-                test.pSession->bHandshakeStart && !test.pSession->bHandshakeDone, "A successful upgrade queues its full answer");
-            CHECK(XAPI_Service(&api, 100) == XEVENTS_SUCCESS && test.pSession && test.pSession->bHandshakeDone &&
-                !test.pSession->txBuffer.nUsed, "The server completes its handshake only after sending the answer");
-            uint8_t wire[4096];
-            ssize_t nRead = recv(pair[1], wire, sizeof(wire), MSG_DONTWAIT);
-            xhttp_t response;
-            CHECK(nRead > 0 && XHTTP_ParseData(&response, wire, nRead) == XHTTP_COMPLETE,
-                "The peer receives a complete HTTP upgrade response");
-            CHECK(response.eType == XHTTP_RESPONSE && response.nStatusCode == 101 && !strcmp(response.sVersion, "1.1") &&
-                !XHTTP_GetBodySize(&response), "Every successful upgrade has status 101, HTTP/1.1 and no unexpected body");
-            const char *pNames[] = {"Upgrade", "Connection", "Sec-WebSocket-Accept", "Server"};
-            const char *pValues[] = {"websocket", "Upgrade", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "allocation-server"};
-            for (size_t j = 0; j < sizeof(pNames) / sizeof(*pNames); j++)
+            alloc_ws_t test = {0};
+            xapi_t api;
+            int pair[2];
+            CHECK(XAPI_Init(&api, alloc_ws_callback, &test) == XSTDOK && !socketpair(AF_UNIX, SOCK_STREAM, 0, pair),
+                "Create a websocket server before injecting failures");
+            api.bFullHandshakeCb = bFull;
+            xapi_endpoint_t endpoint;
+            XAPI_InitEndpoint(&endpoint);
+            endpoint.eType = XAPI_WS;
+            endpoint.eRole = XAPI_PEER;
+            endpoint.nEvents = XPOLLIN;
+            endpoint.nFD = pair[0];
+            CHECK(XAPI_AddEvent(&api, &endpoint) == XSTDOK && test.pSession, "Register the accepted websocket transport");
+            strcpy(test.pSession->sUserAgent, "allocation-server");
+            CHECK(XSock_NonBlock(&test.pSession->sock, XTRUE) >= 0 &&
+                XByteBuffer_Add(&test.pSession->rxBuffer, (const uint8_t*)request, sizeof(request) - 1) == sizeof(request) - 1,
+                "Provide the complete known upgrade request before failing allocations");
+            api.events.nEventMax = 4;
+            g_nCalls = 0;
+            g_nFailAt = i ? i : SIZE_MAX;
+            int nStatus = XAPI_ProcessBuffered(test.pSession);
+            g_nFailAt = 0;
+            if (!i) nAllocations = g_nCalls;
+            if (nStatus == XAPI_CONTINUE)
             {
-                const char *pValue = XHTTP_GetHeader(&response, pNames[j]);
-                CHECK(pValue && !strcmp(pValue, pValues[j]), "The answer contains the exact headers and known accept digest");
+                CHECK(test.pSession->txBuffer.nUsed && !test.pSession->rxBuffer.nUsed && !test.nErrors &&
+                    test.pSession->bHandshakeStart && !test.pSession->bHandshakeDone,
+                    "A successful upgrade queues its full answer");
+                CHECK(XAPI_Service(&api, 100) == XEVENTS_SUCCESS && test.pSession && test.pSession->bHandshakeDone &&
+                    !test.pSession->txBuffer.nUsed, "The server completes its handshake only after sending the answer");
+                uint8_t wire[4096];
+                ssize_t nRead = recv(pair[1], wire, sizeof(wire), MSG_DONTWAIT);
+                xhttp_t response;
+                CHECK(nRead > 0 && XHTTP_ParseData(&response, wire, nRead) == XHTTP_COMPLETE,
+                    "The peer receives a complete HTTP upgrade response");
+                CHECK(response.eType == XHTTP_RESPONSE && response.nStatusCode == 101 && !strcmp(response.sVersion, "1.1") &&
+                    !XHTTP_GetBodySize(&response), "Every successful upgrade has status 101, HTTP/1.1 and no unexpected body");
+                const char *pNames[] = {"Upgrade", "Connection", "Sec-WebSocket-Accept", "Server"};
+                const char *pValues[] = {"websocket", "Upgrade", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "allocation-server"};
+                for (size_t j = 0; j < sizeof(pNames) / sizeof(*pNames); j++)
+                {
+                    const char *pValue = XHTTP_GetHeader(&response, pNames[j]);
+                    CHECK(pValue && !strcmp(pValue, pValues[j]), "The answer contains the exact headers and known accept digest");
+                }
+                XHTTP_Clear(&response);
             }
-            XHTTP_Clear(&response);
+            else
+            {
+                nFailures++;
+                CHECK(i && nStatus == XAPI_DISCONNECT && test.nErrors && !test.pSession->txBuffer.nUsed && !test.nClosed,
+                    "A failed buffered upgrade reports its failure, queues no partial answer and leaves cleanup to its caller");
+            }
+            CHECK(!test.pSession->pPacket, "No borrowed handshake pointer escapes the callback");
+            XAPI_Destroy(&api);
+            close(pair[1]);
+            CHECK(test.nClosed == 1 && fcntl(pair[0], F_GETFD) < 0 && errno == EBADF, "Every server transport is released once");
         }
-        else
-        {
-            nFailures++;
-            CHECK(i && nStatus == XAPI_DISCONNECT && test.nErrors && !test.pSession->txBuffer.nUsed && !test.nClosed,
-                "A failed buffered upgrade reports its failure, queues no partial answer and leaves cleanup to its caller");
-        }
-        CHECK(!test.pSession->pPacket, "No borrowed handshake pointer escapes the callback");
-        XAPI_Destroy(&api);
-        close(pair[1]);
-        CHECK(test.nClosed == 1 && fcntl(pair[0], F_GETFD) < 0 && errno == EBADF, "Every server transport is released once");
+        CHECK(nFailures > 20, "Fail incoming parsing, response initialization, accept digest, headers and output allocations");
     }
-    CHECK(nFailures > 20, "Fail incoming parsing, response initialization, accept digest, headers and output allocations");
     return 0;
 }
 

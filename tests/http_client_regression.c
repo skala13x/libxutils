@@ -1138,9 +1138,60 @@ static int XTest_client_paths(void)
     return 0;
 }
 
+/* An https server that accepts and then never answers the handshake. The timeout used to be set only after the open,
+ * which takes in the connect and the handshake, so the client waited for the server's hello for good. */
+static int XTest_connect_timeout(void)
+{
+#ifdef XSOCK_USE_SSL
+    alarm(60);
+    int nListen = (int)socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(nListen >= 0, "A listener socket is created");
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    socklen_t nLen = sizeof(addr);
+    CHECK(bind(nListen, (struct sockaddr*)&addr, nLen) == 0 &&
+        getsockname(nListen, (struct sockaddr*)&addr, &nLen) == 0 &&
+        listen(nListen, 8) == 0, "A listener that never accepts is set up");
+
+    char sUrl[128];
+    snprintf(sUrl, sizeof(sUrl), "https://127.0.0.1:%u/silent", (unsigned)ntohs(addr.sin_port));
+
+    xlink_t link;
+    CHECK(XLink_Parse(&link, sUrl) == XSTDOK, "The link parses");
+
+    xhttp_t http;
+    CHECK(XHTTP_InitRequest(&http, XHTTP_GET, link.sUri, "1.1") > 0, "The request initializes");
+    http.nTimeout = 1;
+
+    xsock_t sock;
+    uint64_t nStartMs = XTime_GetMonoMs();
+    CHECK(XHTTP_Connect(&http, &sock, &link) == XHTTP_ECONNECT, "A server that never answers the handshake fails the connect");
+    uint64_t nElapsedMs = XTime_GetMonoMs() - nStartMs;
+
+    CHECK(nElapsedMs >= 900, "Once the timeout ran out");
+    CHECK(nElapsedMs < 10000, "And not much later");
+    CHECK(XSock_GetSysError(&sock) == EAGAIN || XSock_GetSysError(&sock) == EWOULDBLOCK,
+        "With the error of a socket that timed out");
+
+    XSock_Close(&sock);
+    XHTTP_Clear(&http);
+    close(nListen);
+    alarm(0);
+    return 0;
+#else
+    printf("No TLS, skipping\n");
+    return 77;
+#endif
+}
+
 XTEST_MAIN(
     XTEST_CASE(client_paths),
     XTEST_CASE(connect),
+    XTEST_CASE(connect_timeout),
     XTEST_CASE(link_exchange),
     XTEST_CASE(easy_exchange),
     XTEST_CASE(perform),

@@ -343,6 +343,21 @@ XSOCKET XSock_Create(xsock_t* pSock, uint32_t nFlags, const char* pAddr, uint16_
 XSOCKET XSock_Open(xsock_t* pSock, uint32_t nFlags, xsock_info_t* pAddr);
 XSOCKET XSock_Setup(xsock_t* pSock, uint32_t nFlags, const char* pAddr);
 
+/*!
+ * @brief XSock_Open() with every wait of a blocking TCP client bounded by nTimeoutSec.
+ *
+ * The connect is given up after nTimeoutSec (XSOCK_ERR_CONNECT, ETIMEDOUT), and
+ * the receive and send timeouts are set to it before the TLS handshake, so no
+ * read or write of the handshake or after it waits longer. A receive timeout set
+ * once the open returned left both unbounded: an address that never answers held
+ * the caller for the kernel's SYN retry budget, and a server that accepted and
+ * then stayed silent held it in SSL_connect() for good.
+ *
+ * Any other socket (non-blocking, Unix, server) and nTimeoutSec <= 0 open
+ * exactly as XSock_Open() does.
+ */
+XSOCKET XSock_OpenTimed(xsock_t* pSock, uint32_t nFlags, xsock_info_t* pAddr, int nTimeoutSec);
+
 xsock_t* XSock_Alloc(uint32_t nFlags, const char* pAddr, uint16_t nPort);
 xsock_t* XSock_New(uint32_t nFlags, xsock_info_t* pAddr);
 void XSock_Free(xsock_t* pSock);

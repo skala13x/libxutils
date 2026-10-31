@@ -19,6 +19,11 @@ typedef struct {
     int nErrors;
     int nLastError;
     int nUsers;
+    int nRequests;
+    int nAnswers;
+    size_t nSerialized;
+    xbool_t bEmptyPacket;
+    xbool_t bEditPacket;
     xbool_t bUser;
     xbool_t bBadContext;
     xbool_t bBadHTTP;
@@ -60,6 +65,19 @@ static int branch_callback(xapi_ctx_t *pCtx, xapi_session_t *pSession)
         if (nLength) memcpy(pTest->received + pTest->nReceived, pBytes, nLength);
         pTest->nReceived += nLength;
         pTest->nReads++;
+    }
+    if (pCtx->eCbType == XAPI_CB_HANDSHAKE_REQUEST || pCtx->eCbType == XAPI_CB_HANDSHAKE_ANSWER)
+    {
+        xhttp_t *pHttp = pSession->pPacket;
+        if (pCtx->eCbType == XAPI_CB_HANDSHAKE_REQUEST) pTest->nRequests++;
+        else pTest->nAnswers++;
+
+        if (pCtx->eCbType == pTest->eAction)
+        {
+            pTest->nSerialized = pHttp->rawData.nUsed;
+            if (pTest->bEmptyPacket) XByteBuffer_Reset(&pHttp->rawData);
+            if (pTest->bEditPacket && XHTTP_AddHeader(pHttp, "X-Handshake", "edited") <= 0) return XAPI_DISCONNECT;
+        }
     }
     if (pCtx->eCbType == XAPI_CB_USER) { pTest->nUsers++; return pTest->nAction; }
     if (pCtx->eCbType == pTest->eAction) return pTest->bUser ? XAPI_USER_CB : pTest->nAction;
@@ -398,6 +416,126 @@ static int XTest_cancel_ready(void)
     return 0;
 }
 
+/* A WebSocket client on a private transport, serviced until it has tried to send its upgrade request. pWire gets
+   what reached the other end; *pRead is 0 when the session was closed before anything was sent. */
+static int branch_ws_client(branch_api_t *pTest, xbool_t bFull, char *pWire, size_t nWire, ssize_t *pRead)
+{
+    int pair[2];
+    CHECK(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair), "Create the private WebSocket client transport");
+    CHECK(XAPI_Init(&pTest->api, branch_callback, pTest) == XSTDOK, "Initialize the WebSocket client fixture");
+    pTest->api.bFullHandshakeCb = bFull;
+
+    xapi_endpoint_t endpoint;
+    XAPI_InitEndpoint(&endpoint);
+    endpoint.eType = XAPI_WS;
+    endpoint.eRole = XAPI_CLIENT;
+    endpoint.nEvents = XPOLLOUT;
+    endpoint.nPort = 4321;
+    endpoint.pUri = "/socket";
+    endpoint.nFD = pair[0];
+    CHECK(XAPI_AddEvent(&pTest->api, &endpoint) == XSTDOK && pTest->pSession, "Register the WebSocket client");
+    strcpy(pTest->pSession->sAddr, "example.test");
+    CHECK(XSock_NonBlock(&pTest->pSession->sock, XTRUE) >= 0, "Upgrade writes cannot block");
+
+    for (int i = 0; i < 3 && pTest->pSession; i++)
+        CHECK(XAPI_Service(&pTest->api, 50) == XEVENTS_SUCCESS, "The upgrade attempt stays contained to its session");
+
+    *pRead = recv(pair[1], pWire, nWire - 1, MSG_DONTWAIT);
+    pWire[*pRead > 0 ? *pRead : 0] = '\0';
+
+    XAPI_Destroy(&pTest->api);
+    close(pair[1]);
+    return 0;
+}
+
+/* A WebSocket peer handed a complete upgrade request, serviced until it has tried to answer it. */
+static int branch_ws_peer(branch_api_t *pTest, xbool_t bFull, char *pWire, size_t nWire, ssize_t *pRead)
+{
+    const char request[] = "GET /socket HTTP/1.1\r\nHost: example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    int pair[2];
+    CHECK(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair), "Create the private WebSocket peer transport");
+    CHECK(XAPI_Init(&pTest->api, branch_callback, pTest) == XSTDOK, "Initialize the WebSocket peer fixture");
+    pTest->api.bFullHandshakeCb = bFull;
+
+    xapi_endpoint_t endpoint;
+    XAPI_InitEndpoint(&endpoint);
+    endpoint.eType = XAPI_WS;
+    endpoint.eRole = XAPI_PEER;
+    endpoint.nEvents = XPOLLIN;
+    endpoint.nFD = pair[0];
+    CHECK(XAPI_AddEvent(&pTest->api, &endpoint) == XSTDOK && pTest->pSession, "Register the accepted WebSocket peer");
+    CHECK(XSock_NonBlock(&pTest->pSession->sock, XTRUE) >= 0, "Upgrade writes cannot block");
+    CHECK(send(pair[1], request, sizeof(request) - 1, 0) == (ssize_t)(sizeof(request) - 1), "Send the upgrade request");
+
+    for (int i = 0; i < 4 && pTest->pSession && !pTest->pSession->bHandshakeDone; i++)
+        CHECK(XAPI_Service(&pTest->api, 50) == XEVENTS_SUCCESS, "The upgrade answer stays contained to its session");
+
+    *pRead = recv(pair[1], pWire, nWire - 1, MSG_DONTWAIT);
+    pWire[*pRead > 0 ? *pRead : 0] = '\0';
+
+    XAPI_Destroy(&pTest->api);
+    close(pair[1]);
+    return 0;
+}
+
+static int XTest_handshake_actions(void)
+{
+    /* The outgoing half of an upgrade - the client's request and the server's answer - always goes through
+       XAPI_CB_HANDSHAKE_REQUEST or XAPI_CB_HANDSHAKE_ANSWER. With bFullHandshakeCb the handle it gets is already
+       serialized and that serialization is what is sent; without it the handle holds the message unserialized and is
+       written out after the callback, so whatever the callback changed goes out. The verdict decides either way. */
+    struct { int nAction; xbool_t bEmpty; xbool_t bEdit; xbool_t bSent; xbool_t bSentFull; } cases[] = {
+        { XAPI_CONTINUE, XFALSE, XFALSE, XTRUE, XTRUE },
+        { XAPI_CONTINUE, XFALSE, XTRUE, XTRUE, XTRUE },
+        { XAPI_CONTINUE, XTRUE, XFALSE, XTRUE, XFALSE },
+        { XAPI_DISCONNECT, XFALSE, XFALSE, XFALSE, XFALSE },
+        { XAPI_RELOOP, XFALSE, XFALSE, XTRUE, XTRUE }
+    };
+
+    char sWire[1024];
+    ssize_t nRead = 0;
+    branch_api_t test;
+
+    for (int bServer = 0; bServer < 2; bServer++)
+    {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        {
+            for (int bFull = 0; bFull < 2; bFull++)
+            {
+                memset(&test, 0, sizeof(test));
+                test.eAction = bServer ? XAPI_CB_HANDSHAKE_ANSWER : XAPI_CB_HANDSHAKE_REQUEST;
+                test.nAction = cases[i].nAction;
+                test.bEmptyPacket = cases[i].bEmpty;
+                test.bEditPacket = cases[i].bEdit;
+
+                if (bServer) CHECK(branch_ws_peer(&test, bFull, sWire, sizeof(sWire), &nRead) == 0, "Run the server upgrade");
+                else CHECK(branch_ws_client(&test, bFull, sWire, sizeof(sWire), &nRead) == 0, "Run the client upgrade");
+
+                xbool_t bSent = bFull ? cases[i].bSentFull : cases[i].bSent;
+                CHECK(test.nRequests == 1 && test.nAnswers == bServer, "The outgoing callback runs once in either mode");
+                CHECK(bFull ? test.nSerialized > 0 : test.nSerialized == 0,
+                    "Only bFullHandshakeCb hands the callback a serialized message");
+                CHECK(!test.nErrors, "A callback verdict is not reported as an error");
+                CHECK(bSent == (nRead > 0), "A refused message is never sent, and an emptied one only when it was serialized");
+                CHECK(!bSent || !strcmp(sWire + nRead - 4, "\r\n\r\n"), "What is sent is a complete message");
+                CHECK(!bSent || bServer || (!strncmp(sWire, "GET /socket HTTP/1.1\r\n", 22) &&
+                    strstr(sWire, "\r\nSec-WebSocket-Key: ") && strstr(sWire, "\r\nHost: example.test:4321\r\n")),
+                    "The client sends its upgrade request");
+                CHECK(!bSent || !bServer || (!strncmp(sWire, "HTTP/1.1 101 ", 13) &&
+                    strstr(sWire, "\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n")),
+                    "The server sends its upgrade answer");
+                CHECK(!bSent || !cases[i].bEdit || (strstr(sWire, "\r\nX-Handshake: edited\r\n") != NULL) == !bFull,
+                    "A header the callback adds goes out unless the message was serialized before it");
+                CHECK(bSent || test.nClosed == 1, "A message that is not sent closes its session");
+            }
+        }
+    }
+
+    return 0;
+}
+
 XTEST_MAIN(XTEST_CASE(timer_actions),
     XTEST_CASE(buffered_actions),
     XTEST_CASE(tick_actions),
@@ -406,5 +544,6 @@ XTEST_MAIN(XTEST_CASE(timer_actions),
     XTEST_CASE(ws_key_policy),
     XTEST_CASE(ws_token_refusals),
     XTEST_CASE(http_client_ip),
-    XTEST_CASE(cancel_ready)
+    XTEST_CASE(cancel_ready),
+    XTEST_CASE(handshake_actions)
 )
