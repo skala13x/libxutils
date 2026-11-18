@@ -5,6 +5,9 @@
  * loopback stream never touches, so each gets a fixture of its own here.
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "test.h"
 #include "sock.h"
 #include "buf.h"
@@ -316,6 +319,168 @@ static int XTest_nonblocking_accept(void)
     return 0;
 }
 
+static int XTest_pending_and_timeout(void)
+{
+    /* Nothing to read the state of, and no option to set, on a socket that is not open. */
+    xsock_t closed;
+    memset(&closed, 0, sizeof(closed));
+    closed.nFD = XSOCK_INVALID;
+    CHECK(XSock_PendingBytes(NULL) == XSTDERR, "A missing socket has no queue to report");
+    CHECK(XSock_PendingBytes(&closed) == XSTDERR, "A closed socket has no queue to report");
+    CHECK(XSock_UserTimeout(NULL, 1000) == XSTDERR, "A missing socket takes no user timeout");
+    CHECK(XSock_UserTimeout(&closed, 1000) == XSTDERR, "A closed socket takes no user timeout");
+
+    xsock_t server;
+    uint16_t nPort = 0;
+
+    for (uint16_t nTry = 39500; nTry < 39600 && !nPort; nTry++)
+    {
+        if (XSock_Create(&server, XSOCK_TCP_SERVER | XSOCK_REUSEADDR, "127.0.0.1", nTry) != XSOCK_INVALID &&
+            XSock_Status(&server) == XSOCK_ERR_NONE) nPort = nTry;
+        else XSock_Close(&server);
+    }
+
+    if (!nPort)
+    {
+        printf("No free loopback port, skipping\n");
+        return 77;
+    }
+
+    xsock_t client, peer;
+    CHECK(XSock_Create(&client, XSOCK_TCP_CLIENT, "127.0.0.1", nPort) != XSOCK_INVALID, "The client connects");
+    XSOCKET nAccepted = XSock_Accept(&server, &peer);
+    CHECK(nAccepted != XSOCK_INVALID, "The connection is accepted");
+
+#if defined(__linux__)
+    /* The kernel holds exactly the value asked for, in milliseconds. */
+    CHECK(XSock_UserTimeout(&client, 12345) == XSTDOK, "A user timeout is set on a connected socket");
+    unsigned int nValue = 0;
+    socklen_t nLen = sizeof(nValue);
+    CHECK(getsockopt(client.nFD, IPPROTO_TCP, TCP_USER_TIMEOUT, &nValue, &nLen) == 0, "The user timeout reads back");
+    CHECK(nValue == 12345, "The user timeout is the one that was set");
+    CHECK(XSock_UserTimeout(&client, 0) == XSTDOK, "A zero user timeout restores the system default");
+#else
+    CHECK(XSock_UserTimeout(&client, 12345) != XSTDERR, "A user timeout is set or reported unsupported");
+#endif
+    CHECK(XSock_Check(&client), "Setting the user timeout leaves the socket open");
+
+    int nIdle = XSock_PendingBytes(&client);
+#if defined(__linux__) || defined(__APPLE__)
+    CHECK(nIdle == 0, "A connection that sent nothing holds nothing");
+
+    /* Fill everything the peer will take without reading: what is left is queued in the sender's kernel. */
+    CHECK(XSock_NonBlock(&client, XTRUE) != XSOCK_INVALID, "The client is made non blocking");
+    static char fill[65536];
+    memset(fill, 'q', sizeof(fill));
+    size_t nWritten = 0;
+    for (int i = 0; i < 4096; i++)
+    {
+        ssize_t nSent = send(client.nFD, fill, sizeof(fill), 0);
+        if (nSent <= 0) break;
+        nWritten += (size_t)nSent;
+    }
+
+    int nQueued = XSock_PendingBytes(&client);
+    CHECK(nWritten > 0 && nQueued > 0, "Data the peer has not taken is reported as pending");
+    CHECK((size_t)nQueued <= nWritten, "No more is pending than was written");
+
+    /* Once the peer reads it all, the queue empties. */
+    CHECK(XSock_NonBlock(&peer, XTRUE) != XSOCK_INVALID, "The peer is made non blocking");
+    size_t nRead = 0;
+    uint64_t nStart = XTime_GetMs();
+    while (nRead < nWritten && XTime_GetMs() - nStart < 10000)
+    {
+        ssize_t nGot = recv(peer.nFD, fill, sizeof(fill), 0);
+        if (nGot > 0) nRead += (size_t)nGot;
+        else xusleep(1000);
+    }
+
+    CHECK(nRead == nWritten, "The peer reads everything that was written");
+    int nDrained = XSock_PendingBytes(&client);
+    for (int i = 0; i < 1000 && nDrained > 0; i++)
+    {
+        xusleep(1000);
+        nDrained = XSock_PendingBytes(&client);
+    }
+
+    CHECK(nDrained == 0, "A drained connection holds nothing");
+#else
+    CHECK(nIdle == XSTDERR, "A platform without a queue query says so");
+#endif
+
+    XSock_Close(&peer);
+    XSock_Close(&client);
+    XSock_Close(&server);
+    return 0;
+}
+
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/wait.h>
+
+/* Runs in a child with its own network namespace, where loopback drops every packet once the connection is up */
+static int pending_write_map(const char *pPath, const char *pText)
+{
+    FILE *pFile = fopen(pPath, "w");
+    if (pFile == NULL) return 0;
+    int nOk = fputs(pText, pFile) >= 0;
+    return fclose(pFile) == 0 && nOk;
+}
+
+static int pending_unacked_child(void)
+{
+    char sMap[64];
+    unsigned int nUid = (unsigned int)getuid(), nGid = (unsigned int)getgid();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) return 77;
+
+    /* Root inside the namespace, as unshare -r does, so ip and tc keep their capabilities across exec */
+    snprintf(sMap, sizeof(sMap), "0 %u 1", nUid);
+    if (!pending_write_map("/proc/self/uid_map", sMap)) return 77;
+    if (!pending_write_map("/proc/self/setgroups", "deny")) return 77;
+    snprintf(sMap, sizeof(sMap), "0 %u 1", nGid);
+    if (!pending_write_map("/proc/self/gid_map", sMap)) return 77;
+    if (system("ip link set lo up >/dev/null 2>&1") != 0) return 77;
+
+    xsock_t server, client, peer;
+    CHECK(XSock_Create(&server, XSOCK_TCP_SERVER | XSOCK_REUSEADDR, "127.0.0.1", 39650) != XSOCK_INVALID,
+        "The listener opens inside the namespace");
+    CHECK(XSock_Create(&client, XSOCK_TCP_CLIENT, "127.0.0.1", 39650) != XSOCK_INVALID, "The client connects");
+    CHECK(XSock_Accept(&server, &peer) != XSOCK_INVALID, "The connection is accepted");
+
+    if (system("tc qdisc add dev lo root netem loss 100% >/dev/null 2>&1") != 0) return 77;
+
+    /* Sent and never acknowledged: a link that died under a connection looks exactly like this */
+    static const char sData[1000] = { 'u' };
+    CHECK(send(client.nFD, sData, sizeof(sData), 0) == (ssize_t)sizeof(sData), "The client sends into the dead link");
+    xusleep(50000);
+
+    CHECK(XSock_PendingBytes(&client) == (int)sizeof(sData), "Sent but unacknowledged bytes count as pending");
+
+    XSock_Close(&peer);
+    XSock_Close(&client);
+    XSock_Close(&server);
+    return 0;
+}
+#endif
+
+static int XTest_pending_unacked(void)
+{
+#if defined(__linux__)
+    pid_t nPid = fork();
+    CHECK(nPid >= 0, "The namespace child forks");
+    if (nPid == 0) XTEST_EXIT(pending_unacked_child());
+
+    int nStatus = 0;
+    CHECK(waitpid(nPid, &nStatus, 0) == nPid, "The namespace child is reaped");
+    CHECK(WIFEXITED(nStatus), "The namespace child exits");
+    if (WEXITSTATUS(nStatus) == 77) printf("No user network namespace with netem, skipping\n");
+    return WEXITSTATUS(nStatus);
+#else
+    printf("Unacknowledged bytes are only told apart on Linux, skipping\n");
+    return 77;
+#endif
+}
+
 static int XTest_options(void)
 {
     /* Every option setter reports success on a live socket and failure on
@@ -611,6 +776,8 @@ XTEST_MAIN(
     XTEST_CASE(force_long_path),
     XTEST_CASE(chunked_transfer),
     XTEST_CASE(nonblocking_accept),
+    XTEST_CASE(pending_and_timeout),
+    XTEST_CASE(pending_unacked),
     XTEST_CASE(options),
     XTEST_CASE(buffers_and_alloc),
     XTEST_CASE(datagram_options),

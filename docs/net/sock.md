@@ -481,6 +481,32 @@ Cross-platform socket wrapper covering TCP, UDP, Unix sockets, socket options an
   - fd on success.
   - `XSOCK_INVALID` on failure.
 
+#### `XSTATUS XSock_UserTimeout(xsock_t *pSock, uint32_t nTimeoutMs)`
+
+- Arguments:
+  - open socket plus the time in milliseconds sent data may stay unacknowledged.
+- Does:
+  - sets `TCP_USER_TIMEOUT` on Linux, `TCP_MAXRT` on Windows and `TCP_RXT_CONNDROPTIME` on macOS (both whole
+    seconds, rounded up so a short timeout never becomes the system default of zero). The kernel then aborts a
+    connection whose peer stopped acknowledging after that long, instead of retransmitting for many minutes.
+  - unlike the setters above, leaves the socket open when the option cannot be set: it only shortens how long a
+    dead peer goes unnoticed.
+- Returns:
+  - `XSTDOK` when set.
+  - `XSTDNON` when the platform has no such option.
+  - `XSTDERR` on a closed socket or a failed `setsockopt` (the socket's error is set).
+
+#### `int XSock_PendingBytes(const xsock_t *pSock)`
+
+- Arguments:
+  - open socket.
+- Does:
+  - reads how much the kernel still holds for the socket: unsent plus unacknowledged bytes on Linux (`SIOCOUTQ`),
+    the send buffer on macOS (`SO_NWRITE`). A write queued now waits behind that many bytes.
+- Returns:
+  - the byte count.
+  - `XSTDERR` when the socket is not open or the platform cannot tell (Windows).
+
 #### `XSOCKET XSock_Bind(xsock_t *pSock)`
 
 - Arguments:

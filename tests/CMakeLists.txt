@@ -233,7 +233,7 @@ if(UNIX)
         length_bounded length_claimed close_eof
         tls_close_notify tls_truncated tls_length tls_option)
     xutils_regression(sock_ext_regression net unix_stream force_long_path chunked_transfer nonblocking_accept
-        options buffers_and_alloc datagram_options address_accessors flag_guards)
+        pending_and_timeout pending_unacked options buffers_and_alloc datagram_options address_accessors flag_guards)
     xutils_regression(sock_timeout_regression net boundaries timed_connect timed_handshake)
     xutils_regression(sock_api_regression net null_args stream_errors call_guards address_conversion address_info status_strings
         accessors buffers listener create_guards udp failed_create_state address_port_range option_failures

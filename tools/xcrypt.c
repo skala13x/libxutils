@@ -306,6 +306,13 @@ static xbool_t XCrypt_GetKey(xcrypt_args_t *pArgs, xcrypt_key_t *pKey)
 
 static xbool_t XCrypt_GetIV(xcrypt_args_t *pArgs, xcrypt_key_t *pKey)
 {
+    if (pKey->bCrypt == XFALSE)
+    {
+        // IV is self-contained, not requierd for decrypt
+        memset(pKey->sIV, 0, sizeof(pKey->sIV));
+        return XTRUE;
+    }
+
     if (xstrused(pArgs->sIV))
     {
         size_t nLength = xstrncpy(pKey->sIV, sizeof(pKey->sIV), pArgs->sIV);
@@ -322,12 +329,12 @@ static xbool_t XCrypt_GetIV(xcrypt_args_t *pArgs, xcrypt_key_t *pKey)
     sIV[0] = XSTR_NUL;
 
     const char *pCipher = XCrypt_GetCipherStr(pKey->eCipher);
-    printf("Enter IV for the cipher '%s': ", pCipher);
+    printf("Enter IV for the cipher '%s' (leave empty for random): ", pCipher);
 
     size_t nLength = XCLI_GetPass(NULL, pKey->sIV, sizeof(pKey->sIV));
     if (!nLength && !pArgs->bDecrypt)
     {
-        xlogw("Random IV will be used for cipher '%s'", pCipher);
+        printf("Random IV will be used for cipher '%s'\n", pCipher);
         memset(pKey->sIV, 0, sizeof(pKey->sIV));
     }
 

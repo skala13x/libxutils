@@ -192,58 +192,9 @@ static void XPass_DisplayUsage(const char *pName)
 
 static xbool_t XPass_GetIV(xpass_ctx_t *pCtx)
 {
-    if (xstrused(pCtx->sIV))
-    {
-        size_t nLength = strlen(pCtx->sIV);
-        if (nLength < 16)
-        {
-            xlogw("IV is too short, will be padded with empty spaces");
-            memset(pCtx->sIV + nLength, XSTR_SPACE_CHAR, 16 - nLength);
-        }
-
-        return XTRUE;
-    }
-
-    char sIV[XSTR_PICO];
-    sIV[0] = XSTR_NUL;
-
-    printf("Enter IV for the cipher 'AES': ");
-
-    size_t nLength = XCLI_GetPass(NULL, pCtx->sIV, sizeof(pCtx->sIV));
-    if (!nLength)
-    {
-        xlogw("Random IV will be used for cipher 'AES'");
-        memset(pCtx->sIV, 0, sizeof(pCtx->sIV));
-    }
-
-    if (nLength > 0 && pCtx->bForce)
-    {
-        printf("Re-enter IV for the cipher 'AES': ");
-        sIV[0] = XSTR_NUL;
-
-        if (!XCLI_GetPass(NULL, sIV, sizeof(sIV)))
-        {
-            xloge("Failed to read IV: %d", errno);
-            return XFALSE;
-        }
-
-        if (strcmp(pCtx->sIV, sIV))
-        {
-            xloge("IV do not match");
-            return XFALSE;
-        }
-    }
-
-    if (nLength > 0)
-    {
-        nLength = strlen(pCtx->sIV);
-        if (nLength < 16)
-        {
-            xlogw("IV is too short, will be padded with empty spaces");
-            memset(pCtx->sIV + nLength, XSTR_SPACE_CHAR, 16 - nLength);
-        }
-    }
-
+    /* Random IV will be used to encrypt the storage file
+       and self-contained IV will be used to decript it */
+    memset(pCtx->sIV, 0, sizeof(pCtx->sIV));
     return XTRUE;
 }
 

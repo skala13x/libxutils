@@ -71,6 +71,7 @@ typedef struct XCryptKey
     char sKey[XSTR_MID];
     char sIV[XSTR_MICRO];
     size_t nLength;
+    xbool_t bCrypt;
 } xcrypt_key_t;
 
 typedef xbool_t(*xcrypt_cb_t)(xcrypt_cb_type_t, void*, void*);

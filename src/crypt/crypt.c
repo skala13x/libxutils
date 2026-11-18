@@ -427,7 +427,6 @@ void XCrypt_ErrorCallback(xcrypt_ctx_t *pCtx, const char *pStr, ...)
 xbool_t XCrypt_KeyCallback(xcrypt_ctx_t *pCtx, xcrypt_chipher_t eCipher, xcrypt_key_t *pKey)
 {
     if (pCtx == NULL || pKey == NULL) return XFALSE;
-    memset(pKey, 0, sizeof(xcrypt_key_t));
     pKey->eCipher = eCipher;
 
     if (!XCrypt_NeedsKey(eCipher) || pCtx->callback == NULL) return XTRUE;
@@ -449,8 +448,10 @@ void XCrypt_Init(xcrypt_ctx_t *pCtx, xbool_t bDecrypt, char *pCiphers, xcrypt_cb
 
 uint8_t* XCrypt_Single(xcrypt_ctx_t *pCtx, xcrypt_chipher_t eCipher, const uint8_t *pInput, size_t *pLength)
 {
-    xcrypt_key_t encKey;
     if (pLength == NULL) return NULL;
+    xcrypt_key_t encKey = { 0 };
+    encKey.bCrypt = XTRUE;
+
     if (!XCrypt_KeyCallback(pCtx, eCipher, &encKey)) return XFALSE;
 
     const uint8_t *pKey = (const uint8_t*)encKey.sKey;
@@ -513,8 +514,10 @@ uint8_t* XCrypt_Single(xcrypt_ctx_t *pCtx, xcrypt_chipher_t eCipher, const uint8
 
 uint8_t* XDecrypt_Single(xcrypt_ctx_t *pCtx, xcrypt_chipher_t eCipher, const uint8_t *pInput, size_t *pLength)
 {
-    xcrypt_key_t decKey;
     if (pLength == NULL) return NULL;
+    xcrypt_key_t decKey = { 0 };
+    decKey.bCrypt = XFALSE;
+
     if (!XCrypt_KeyCallback(pCtx, eCipher, &decKey)) return XFALSE;
 
     const uint8_t *pKey = (const uint8_t*)decKey.sKey;

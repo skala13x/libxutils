@@ -333,6 +333,15 @@ XSOCKET XSock_ReuseAddr(xsock_t* pSock, xbool_t nEnabled);
 XSOCKET XSock_Oobinline(xsock_t* pSock, xbool_t nEnabled);
 XSOCKET XSock_NonBlock(xsock_t* pSock, xbool_t nNonBlock);
 XSOCKET XSock_NoDelay(xsock_t* pSock, xbool_t nEnabled);
+
+/* How long sent data may stay unacknowledged before the kernel aborts the connection: TCP_USER_TIMEOUT on Linux,
+   whole seconds of TCP_MAXRT on Windows and TCP_RXT_CONNDROPTIME on macOS. XSTDOK when set, XSTDNON when the
+   platform has no such option, XSTDERR on failure. The socket stays open either way. */
+XSTATUS XSock_UserTimeout(xsock_t* pSock, uint32_t nTimeoutMs);
+
+/* Bytes the kernel still holds for the socket: unsent plus unacknowledged on Linux (SIOCOUTQ), the send buffer on
+   macOS (SO_NWRITE). XSTDERR when the platform cannot tell or the socket is not open. */
+int XSock_PendingBytes(const xsock_t* pSock);
 XSOCKET XSock_TimeOutR(xsock_t* pSock, int nSec, int nUsec);
 XSOCKET XSock_TimeOutS(xsock_t* pSock, int nSec, int nUsec);
 XSOCKET XSock_Linger(xsock_t* pSock, int nSec);

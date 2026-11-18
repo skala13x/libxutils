@@ -2036,6 +2036,59 @@ XSOCKET XSock_NoDelay(xsock_t *pSock, xbool_t nEnabled)
     return pSock->nFD;
 }
 
+#if defined(TCP_USER_TIMEOUT) || (defined(_WIN32) && defined(TCP_MAXRT)) || defined(TCP_RXT_CONNDROPTIME)
+#define XSOCK_HAVE_USER_TIMEOUT
+#endif
+
+/* Unlike the setters above, a failure here leaves the socket open: the option only shortens how long a dead
+   peer goes unnoticed, so a platform or kernel without it is no reason to lose a working connection. */
+XSTATUS XSock_UserTimeout(xsock_t *pSock, uint32_t nTimeoutMs)
+{
+    if (!XSock_Check(pSock)) return XSTDERR;
+
+#ifndef XSOCK_HAVE_USER_TIMEOUT
+    (void)nTimeoutMs;
+    return XSTDNON;
+#else
+#if defined(TCP_USER_TIMEOUT)
+    unsigned int nOpt = (unsigned int)nTimeoutMs;
+    int nResult = setsockopt(pSock->nFD, IPPROTO_TCP, TCP_USER_TIMEOUT, (char*)&nOpt, sizeof(nOpt));
+#elif defined(_WIN32)
+    /* Whole seconds, rounded up so a short timeout never becomes zero, which means the system default */
+    DWORD nOpt = (DWORD)((nTimeoutMs + 999U) / 1000U);
+    int nResult = setsockopt(pSock->nFD, IPPROTO_TCP, TCP_MAXRT, (const char*)&nOpt, sizeof(nOpt));
+#else
+    int nOpt = (int)((nTimeoutMs + 999U) / 1000U);
+    int nResult = setsockopt(pSock->nFD, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, (char*)&nOpt, sizeof(nOpt));
+#endif
+
+    if (nResult < 0)
+    {
+        XSock_SetSysError(pSock, XSOCK_ERR_SETOPT, XSOCK_ERRNO());
+        return XSTDERR;
+    }
+
+    return XSTDOK;
+#endif
+}
+
+int XSock_PendingBytes(const xsock_t *pSock)
+{
+    XCHECK_NL((pSock != NULL && pSock->nFD != XSOCK_INVALID), XSTDERR);
+    int nPending = 0;
+
+#if defined(SIOCOUTQ)
+    if (ioctl(pSock->nFD, SIOCOUTQ, &nPending) < 0) return XSTDERR;
+#elif defined(SO_NWRITE)
+    socklen_t nLen = sizeof(nPending);
+    if (getsockopt(pSock->nFD, SOL_SOCKET, SO_NWRITE, &nPending, &nLen) < 0) return XSTDERR;
+#else
+    return XSTDERR;
+#endif
+
+    return nPending >= 0 ? nPending : XSTDERR;
+}
+
 XSOCKET XSock_Bind(xsock_t *pSock)
 {
     XCHECK_NL((pSock != NULL), XSOCK_INVALID);
