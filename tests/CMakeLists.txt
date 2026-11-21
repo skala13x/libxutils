@@ -379,12 +379,13 @@ if(OPENSSL_FOUND AND OPENSSL_VERSION VERSION_GREATER_EQUAL "1.1.0")
             target_link_options(sock_tls_regression PRIVATE -Wl,--wrap=pthread_sigmask)
             target_compile_definitions(sock_tls_regression PRIVATE XTEST_WRAP_SIGMASK)
         endif()
-        xutils_regression(api_tls_regression net handshake async_client async_stalled pkcs12_listener partial_writes
-            plaintext_client missing_identity)
+        xutils_regression(api_tls_regression net handshake async_client async_stalled async_dial_addr blocking_dial_addr
+            pkcs12_listener partial_writes plaintext_client missing_identity)
 
         # Every case here runs a real handshake and moves bytes through it, so
         # under valgrind they are an order of magnitude slower than the rest.
-        foreach(tls_case handshake async_client async_stalled pkcs12_listener partial_writes plaintext_client missing_identity)
+        foreach(tls_case handshake async_client async_stalled async_dial_addr blocking_dial_addr pkcs12_listener partial_writes
+                plaintext_client missing_identity)
             set_tests_properties("api_tls_regression.${tls_case}" PROPERTIES TIMEOUT 300)
         endforeach()
 

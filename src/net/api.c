@@ -2560,6 +2560,7 @@ void XAPI_InitEndpoint(xapi_endpoint_t *pEndpt)
     pEndpt->pUser = NULL;
     pEndpt->pGroup = NULL;
     pEndpt->pAddr = NULL;
+    pEndpt->pIPAddr = NULL;
     pEndpt->pUri = NULL;
     pEndpt->bTLS = XFALSE;
     pEndpt->bUnix = XFALSE;
@@ -2728,11 +2729,16 @@ XSTATUS XAPI_Connect(xapi_t *pApi, xapi_endpoint_t *pEndpt)
     if (pEndpt->bUnix) nFlags |= XSOCK_UNIX;
     else nFlags |= XSOCK_TCP;
 
-    /* Pass the endpoint host as the socket name so the SSL client sends SNI and
-       binds certificate verification to it (X509_VERIFY_PARAM_set1_host). With a
-       NULL name only the chain is verified, so any CA-trusted certificate for any
-       host would be accepted, leaving the TLS link open to an active MITM. */
-    XSock_CreateAdv(pSock, nFlags, 0, pEndpt->pAddr, pEndpt->nPort, pEndpt->pAddr);
+    /* Pass the endpoint host as the socket name so the SSL client sends SNI
+       and binds certificate verification to it (X509_VERIFY_PARAM_set1_host).
+       With a NULL name only the chain is verified, so any CA-trusted certificate
+       for any host would be accepted, leaving the TLS link open to an active MITM.
+       An address the caller resolved already is only what gets dialed. */
+    const char *pDialAddr = (!pEndpt->bUnix && xstrused(pEndpt->pIPAddr)) ?
+                                                        pEndpt->pIPAddr :
+                                                        pEndpt->pAddr;
+
+    XSock_CreateAdv(pSock, nFlags, 0, pDialAddr, pEndpt->nPort, pEndpt->pAddr);
     if (pEndpt->bTLS) XSock_SetSSLCert(pSock, &pEndpt->certs);
 
     if (pSock->nFD == XSOCK_INVALID)

@@ -44,6 +44,7 @@ typedef struct {
     int nClientConnected;
     int nClientErrors;
     int nClientClosed;
+    char sClientAddr[XSOCK_ADDR_MAX];
 } api_tls_t;
 
 static uint16_t api_tls_port(void)
@@ -77,6 +78,7 @@ static int api_tls_client_callback(api_tls_t *pTest, xapi_ctx_t *pCtx, xapi_sess
         case XAPI_CB_CONNECTED:
         {
             pTest->nClientConnected++;
+            xstrncpy(pTest->sClientAddr, sizeof(pTest->sClientAddr), pSession->sAddr);
             if (pTest->pClientRequest == NULL) return XAPI_CONTINUE;
 
             xbyte_buffer_t *pTx = XAPI_GetTxBuff(pSession);
@@ -720,10 +722,213 @@ static int XTest_async_stalled(void)
     return 0;
 }
 
+static int XTest_async_dial_addr(void)
+{
+    /* A client handed the address of its host already resolved dials that address and looks nothing up, while the
+     * host's name still decides what the certificate has to say. A name that would not resolve is never asked for:
+     * the endpoint registers at once and the handshake then fails on the name, not on the address it reached. */
+    tls_fixture_t fixture;
+    if (tls_fixture_begin(&fixture) != XSTDOK)
+    {
+        tls_fixture_end(&fixture);
+        printf("No TLS fixture could be built, skipping\n");
+        return 77;
+    }
+
+    api_tls_t test;
+    int nPrep = api_tls_listen(&test, &fixture, XFALSE);
+    if (nPrep != 0)
+    {
+        tls_fixture_end(&fixture);
+        printf("No TLS listener could be created, skipping\n");
+        return nPrep;
+    }
+
+    test.pClientRequest = "a request to a resolved address";
+    xapi_endpoint_t client = api_tls_async_endpoint(test.nPort, fixture.sCert);
+    client.pAddr = "localhost";
+    client.pIPAddr = "127.0.0.1";
+    unsigned long nTimeoutMs = api_tls_timeout_ms();
+
+    alarm((unsigned int)(nTimeoutMs / 1000U) * 2U);
+    XSTATUS nStatus = XAPI_AddEndpoint(&test.api, &client);
+
+    uint64_t nDeadlineMs = XTime_GetMs() + nTimeoutMs;
+    while (nStatus == XSTDOK && test.nReceived < strlen(test.pClientRequest) && XTime_GetMs() < nDeadlineMs)
+        XAPI_Service(&test.api, 25);
+
+    alarm(0);
+    api_tls_t named = test;
+    XAPI_Destroy(&test.api);
+
+    CHECK(nStatus == XSTDOK, "The client endpoint with a resolved address is registered");
+    CHECK(named.nReceived == strlen(named.pClientRequest), "The request crossed a handshake verified for the name");
+    CHECK(strcmp(named.sClientAddr, "localhost") == 0, "The session keeps the name for its Host header");
+    CHECK(named.nClientErrors == 0 && named.nClientClosed == 0, "The client saw no error");
+
+    nPrep = api_tls_listen(&test, &fixture, XFALSE);
+    if (nPrep != 0)
+    {
+        tls_fixture_end(&fixture);
+        printf("No second TLS listener could be created, skipping\n");
+        return nPrep;
+    }
+
+    test.pClientRequest = "a request the certificate does not cover";
+    client = api_tls_async_endpoint(test.nPort, fixture.sCert);
+    client.pAddr = "dg-never-resolved.invalid";
+    client.pIPAddr = "127.0.0.1";
+
+    alarm((unsigned int)(nTimeoutMs / 1000U) * 2U);
+    uint64_t nStartMs = XTime_GetMs();
+    nStatus = XAPI_AddEndpoint(&test.api, &client);
+    uint64_t nAddMs = XTime_GetMs() - nStartMs;
+
+    nDeadlineMs = XTime_GetMs() + nTimeoutMs;
+    while (nStatus == XSTDOK && !test.nClientErrors && !test.nClientClosed && XTime_GetMs() < nDeadlineMs)
+        XAPI_Service(&test.api, 25);
+
+    alarm(0);
+    api_tls_t mismatch = test;
+    XAPI_Destroy(&test.api);
+    tls_fixture_end(&fixture);
+
+    CHECK(nStatus == XSTDOK, "A name that does not resolve is not looked up when its address is given");
+    CHECK(nAddMs < nTimeoutMs, "and registering it waits for no resolver");
+    CHECK(mismatch.nClientErrors > 0 || mismatch.nClientClosed > 0, "The certificate is still checked against the name");
+    CHECK(mismatch.nReceived == 0, "so nothing crosses to a host the certificate does not name");
+    return 0;
+}
+
+/* A blocking XAPI client in a thread of its own, against the loop's listener. */
+typedef struct {
+    uint16_t nPort;
+    const char *pAddr;
+    const char *pIPAddr;
+    XSTATUS nStatus;
+    int nConnected;
+    char sAddr[XSOCK_ADDR_MAX];
+    xatomic_t bDone;
+} api_tls_blocking_t;
+
+static int api_tls_blocking_callback(xapi_ctx_t *pCtx, xapi_session_t *pSession)
+{
+    api_tls_blocking_t *pClient = (api_tls_blocking_t*)pCtx->pApi->pUserCtx;
+    if (pCtx->eCbType != XAPI_CB_CONNECTED || pSession == NULL) return XAPI_CONTINUE;
+
+    pClient->nConnected++;
+    xstrncpy(pClient->sAddr, sizeof(pClient->sAddr), pSession->sAddr);
+    return XAPI_CONTINUE;
+}
+
+static void *api_tls_blocking_client(void *pContext)
+{
+    api_tls_blocking_t *pClient = (api_tls_blocking_t*)pContext;
+    xapi_t api;
+
+    pClient->nStatus = XSTDERR;
+    if (XAPI_Init(&api, api_tls_blocking_callback, pClient) != XSTDOK)
+    {
+        XSYNC_ATOMIC_SET(&pClient->bDone, 1);
+        return NULL;
+    }
+
+    xapi_endpoint_t endpt;
+    XAPI_InitEndpoint(&endpt);
+    endpt.eType = XAPI_SOCK;
+    endpt.eRole = XAPI_CLIENT;
+    endpt.pAddr = pClient->pAddr;
+    endpt.pIPAddr = pClient->pIPAddr;
+    endpt.nPort = pClient->nPort;
+    endpt.bTLS = XTRUE;
+
+    pClient->nStatus = XAPI_Connect(&api, &endpt);
+    XAPI_Destroy(&api);
+    XSYNC_ATOMIC_SET(&pClient->bDone, 1);
+    return NULL;
+}
+
+static int api_tls_run_blocking(api_tls_t *pTest, api_tls_blocking_t *pClient)
+{
+    xthread_t thread;
+    if (XThread_Create(&thread, api_tls_blocking_client, pClient, XFALSE) != XSTDOK) return XSTDERR;
+
+    /* The client's handshake runs inside its connect, so the listener has to be serviced until it returns */
+    unsigned long nTimeoutMs = api_tls_timeout_ms();
+    alarm((unsigned int)(nTimeoutMs / 1000U) * 2U);
+
+    uint64_t nDeadlineMs = XTime_GetMs() + nTimeoutMs;
+    while (!XSYNC_ATOMIC_GET(&pClient->bDone) && XTime_GetMs() < nDeadlineMs) XAPI_Service(&pTest->api, 25);
+
+    XThread_Join(&thread);
+    alarm(0);
+    return XSTDOK;
+}
+
+static int XTest_blocking_dial_addr(void)
+{
+    /* The same split on a blocking client, whose handshake runs inside the connect against the system trust store:
+     * the fixture stands in for it. The address is what gets dialed, the name what the certificate must cover. */
+    tls_fixture_t fixture;
+    if (tls_fixture_begin(&fixture) != XSTDOK)
+    {
+        tls_fixture_end(&fixture);
+        printf("No TLS fixture could be built, skipping\n");
+        return 77;
+    }
+
+    char *pSavedFile = getenv("SSL_CERT_FILE") != NULL ? strdup(getenv("SSL_CERT_FILE")) : NULL;
+    char *pSavedDir = getenv("SSL_CERT_DIR") != NULL ? strdup(getenv("SSL_CERT_DIR")) : NULL;
+    setenv("SSL_CERT_FILE", fixture.sCert, 1);
+    unsetenv("SSL_CERT_DIR");
+
+    api_tls_t test;
+    int nPrep = api_tls_listen(&test, &fixture, XFALSE);
+    api_tls_blocking_t named;
+    memset(&named, 0, sizeof(named));
+    named.nPort = test.nPort;
+    named.pAddr = "localhost";
+    named.pIPAddr = "127.0.0.1";
+
+    int nRun = nPrep == 0 ? api_tls_run_blocking(&test, &named) : XSTDERR;
+    if (nPrep == 0) XAPI_Destroy(&test.api);
+
+    api_tls_blocking_t mismatch;
+    memset(&mismatch, 0, sizeof(mismatch));
+    mismatch.pAddr = "dg-never-resolved.invalid";
+    mismatch.pIPAddr = "127.0.0.1";
+
+    int nPrep2 = nPrep == 0 ? api_tls_listen(&test, &fixture, XFALSE) : 77;
+    mismatch.nPort = test.nPort;
+    int nRun2 = nPrep2 == 0 ? api_tls_run_blocking(&test, &mismatch) : XSTDERR;
+    if (nPrep2 == 0) XAPI_Destroy(&test.api);
+
+    if (pSavedFile != NULL) setenv("SSL_CERT_FILE", pSavedFile, 1);
+    else unsetenv("SSL_CERT_FILE");
+    if (pSavedDir != NULL) setenv("SSL_CERT_DIR", pSavedDir, 1);
+    free(pSavedFile);
+    free(pSavedDir);
+    tls_fixture_end(&fixture);
+
+    if (nPrep != 0 || nPrep2 != 0)
+    {
+        printf("No TLS listener could be created, skipping\n");
+        return 77;
+    }
+
+    CHECK(nRun == XSTDOK && nRun2 == XSTDOK, "The client threads ran");
+    CHECK(named.nStatus == XSTDOK && named.nConnected == 1, "A blocking client dials the resolved address");
+    CHECK(strcmp(named.sAddr, "localhost") == 0, "and keeps the name for its Host header");
+    CHECK(mismatch.nStatus != XSTDOK && mismatch.nConnected == 0, "A certificate that does not cover the name fails it");
+    return 0;
+}
+
 XTEST_MAIN(
     XTEST_CASE(handshake),
     XTEST_CASE(async_client),
     XTEST_CASE(async_stalled),
+    XTEST_CASE(async_dial_addr),
+    XTEST_CASE(blocking_dial_addr),
     XTEST_CASE(pkcs12_listener),
     XTEST_CASE(partial_writes),
     XTEST_CASE(plaintext_client),

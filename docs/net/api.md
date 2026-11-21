@@ -367,6 +367,9 @@ High-level event/runtime wrapper over `event.c`, `sock.c`, `http.c`, `mdtp.c` an
 - Does:
   - allocates a client session.
   - creates a non-blocking TCP or Unix client socket, optionally TLS-enabled.
+  - dials `pIPAddr` when the caller set it, a numeric address it resolved for `pAddr` itself, so the connect does
+    no name lookup of its own; `pAddr` still names the host for TLS SNI, certificate verification and the `Host`
+    header. Unix endpoints ignore it.
   - registers it in the event loop and emits `XAPI_CB_CONNECTED`.
 - Returns:
   - `XSTDOK` on success.

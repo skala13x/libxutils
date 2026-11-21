@@ -110,6 +110,9 @@ typedef struct xapi_endpoint_ {
     xsock_cert_t certs;
     void *pSessionData;
     const char *pAddr;
+    /* A client's numeric address for pAddr, looked up by the caller: dialed as it is, so the connect does no name
+       lookup of its own. pAddr still names the host for TLS SNI, certificate verification and the Host header. */
+    const char *pIPAddr;
     const char *pUri;
     const char *pUser;
     const char *pGroup;
