@@ -680,7 +680,8 @@ static int XTest_run_io(void)
     g_fault.nWriteErrno = EAGAIN;
     g_fault.nWriteFaults = 3;
     XExec_ResultInit(&result);
-    CHECK(XExec_Run(&opts, (const uint8_t*)pInput, strlen(pInput), 0, 10000, &result) == XSTDOK, "A run with a busy stdin completes");
+    CHECK(XExec_Run(&opts, (const uint8_t*)pInput, strlen(pInput), 0, 10000, &result) == XSTDOK,
+        "A run with a busy stdin completes");
     CHECK(result.output.nUsed == strlen(pInput), "Input the child was not ready for is written once it is");
     XExec_ResultClear(&result);
 
