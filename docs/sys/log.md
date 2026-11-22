@@ -111,6 +111,8 @@ Process-global singleton logger with screen, file and callback output.
 
 #### `void XLog_FlushSet(xbool_t bEnable)`
 
+#### `void XLog_StdErrSet(xbool_t bEnable)`
+
 #### `void XLog_TraceTid(xbool_t bEnable)`
 
 #### `void XLog_UseHeap(xbool_t bEnable)`
@@ -120,6 +122,8 @@ Process-global singleton logger with screen, file and callback output.
 - Does:
   - updates the corresponding global logger setting.
   - `FileLogSet(XFALSE)` also closes the current file handle.
+  - `StdErrSet(XTRUE)` sends screen output to stderr instead of stdout (macro `xlog_stderr`), for a program whose
+    stdout carries its own data. Off by default.
 - Returns:
   - no return value.
 

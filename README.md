@@ -134,6 +134,7 @@ Each module below links to documentation with API contracts and behavior.
 - [File and screen logging](docs/sys/log.md)
 - [Synchronization primitives](docs/sys/sync.md)
 - [Threading and repeating tasks](docs/sys/thread.md)
+- [Child process execution](docs/sys/exec.md)
 
 ### Miscellaneous
 

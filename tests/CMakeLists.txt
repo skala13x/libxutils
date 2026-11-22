@@ -35,6 +35,20 @@ if(UNIX AND NOT APPLE)
     endforeach()
 endif()
 
+# Every system call exec.c makes, failed on request; close_range() is wrapped, so glibc 2.34 or later
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+check_symbol_exists(close_range "unistd.h" XUTILS_HAVE_CLOSE_RANGE)
+unset(CMAKE_REQUIRED_DEFINITIONS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND XUTILS_HAVE_CLOSE_RANGE)
+    xutils_regression(exec_fault_regression sys spawn_failures nonblock_failures child_failures dupfd_failure descriptor_limits
+        wait_failures kill_paths run_io run_uncollectable)
+    target_link_options(exec_fault_regression PRIVATE -Wl,--wrap=fork -Wl,--wrap=pipe2 -Wl,--wrap=pipe -Wl,--wrap=open
+        -Wl,--wrap=fcntl -Wl,--wrap=dup2 -Wl,--wrap=setsid -Wl,--wrap=setgroups -Wl,--wrap=setgid -Wl,--wrap=setuid
+        -Wl,--wrap=close_range -Wl,--wrap=sysconf -Wl,--wrap=prctl -Wl,--wrap=getppid -Wl,--wrap=waitpid -Wl,--wrap=kill
+        -Wl,--wrap=read -Wl,--wrap=__read_chk -Wl,--wrap=write -Wl,--wrap=XByteBuffer_Add -Wl,--wrap=sigpending)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     xutils_regression(api_worker_fault_regression net start_failure wait_failures stop_failures watch_failures watch_shutdown
         wait_single watch_reaped start_guards start_retry)
@@ -312,6 +326,8 @@ if(UNIX)
     xutils_regression(cli_regression sys null_args async_input window_size window_lines window_align window_display
         progress_bounds progress_output progress_animation input terminal_modes terminal_input read_bounds)
     xutils_regression(sig_regression sys register exit_handler errexit backtrace daemonize)
+    xutils_regression(exec_regression sys null_args exit_status streams low_descriptors input start_failures workdir_env timeout output_cap
+        grace grace_stderr descriptors signals event_loop identity stream_choices lifecycle_edges die_with_parent)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         xutils_regression(cpu_regression sys count affinity guards)
         xutils_regression(cpu_fallback_regression sys count recovery)
@@ -341,7 +357,7 @@ xutils_regression(mdtp_regression net null_args type_mapping assemble_parse pars
     header_combinations header_refusals assemble_refusals assemble_to create_in_place)
 xutils_regression(sock_regression net retry_read retry_write empty_and_eof keep_open interrupted_io accept_cloexec
     accept_flags empty_datagram closed_write pipe_write)
-xutils_regression(log_regression sys api_paths filtering large_message severities flag_mask config
+xutils_regression(log_regression sys api_paths stderr filtering large_message severities flag_mask config
     formatting file_output rotation throw callback_veto enabled)
 xutils_regression(type_regression sys float_bits concurrent printable byte_units kb_units version check_macros)
 

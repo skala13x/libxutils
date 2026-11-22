@@ -89,6 +89,7 @@ add_library(xutils STATIC
     ./src/sys/xfs.c
     ./src/sys/srch.c
     ./src/sys/xtime.c
+    ./src/sys/exec.c
 )
 
 if(OpenSSL_FOUND)
@@ -100,6 +101,10 @@ if(XUTILS_BUILD_TESTS)
     enable_testing()
     if(XUTILS_TEST_COVERAGE AND NOT MSVC)
         target_compile_options(xutils PRIVATE -O0)
+    endif()
+    # A child that leaves through _exit() writes its coverage first (src/sys/exec.c), or its lines never count
+    if(XUTILS_TEST_COVERAGE AND "${CMAKE_C_FLAGS}" MATCHES "--coverage")
+        target_compile_definitions(xutils PRIVATE XEXEC_GCOV_DUMP)
     endif()
     target_link_libraries(xutils PUBLIC Threads::Threads)
     if(OpenSSL_FOUND)

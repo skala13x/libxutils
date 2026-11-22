@@ -657,8 +657,75 @@ static int XTest_api_paths(void)
     return 0;
 }
 
+/* Reads back what a file descriptor received, from the temporary file it was redirected to. */
+static size_t XTest_ReadBack(int nFd, char *pBuffer, size_t nSize)
+{
+    if (lseek(nFd, 0, SEEK_SET) < 0) return 0;
+    ssize_t nRead = read(nFd, pBuffer, nSize - 1);
+    pBuffer[nRead > 0 ? nRead : 0] = '\0';
+    return nRead > 0 ? (size_t)nRead : 0;
+}
+
+static int XTest_stderr(void)
+{
+    char sOutPath[] = "/tmp/xutils_log_stdout.XXXXXX";
+    char sErrPath[] = "/tmp/xutils_log_stderr.XXXXXX";
+    int nOut = mkstemp(sOutPath);
+    int nErr = mkstemp(sErrPath);
+    CHECK(nOut >= 0 && nErr >= 0, "Temporary files for the two streams");
+
+    fflush(stdout);
+    fflush(stderr);
+    int nSavedOut = dup(STDOUT_FILENO);
+    int nSavedErr = dup(STDERR_FILENO);
+    CHECK(nSavedOut >= 0 && nSavedErr >= 0, "Keep the real streams");
+    CHECK(dup2(nOut, STDOUT_FILENO) >= 0 && dup2(nErr, STDERR_FILENO) >= 0, "Redirect both streams");
+
+    xlog_init("stderr-test", XLOG_ALL, XFALSE);
+    xlog_coloring(XLOG_COLORING_DISABLE);
+    xlog_timing(XLOG_DISABLE);
+    xlog_screen(XTRUE);
+    xlog_flush(XTRUE);
+
+    xlogi("to stdout by default");
+    xlog_stderr(XTRUE);
+    xlogi("to stderr when asked");
+
+    xlog_cfg_t cfg;
+    xlog_get(&cfg);
+    int bReported = cfg.bToStdErr;
+
+    xlog_stderr(XFALSE);
+    xlogi("back to stdout");
+    xlog_destroy();
+
+    fflush(stdout);
+    fflush(stderr);
+    dup2(nSavedOut, STDOUT_FILENO);
+    dup2(nSavedErr, STDERR_FILENO);
+    close(nSavedOut);
+    close(nSavedErr);
+
+    char sOut[1024], sErr[1024];
+    XTest_ReadBack(nOut, sOut, sizeof(sOut));
+    XTest_ReadBack(nErr, sErr, sizeof(sErr));
+    close(nOut);
+    close(nErr);
+    unlink(sOutPath);
+    unlink(sErrPath);
+
+    CHECK(bReported, "The configuration reports the stream in use");
+    CHECK(strstr(sOut, "to stdout by default") != NULL && strstr(sOut, "back to stdout") != NULL,
+        "Screen output goes to stdout unless asked otherwise");
+    CHECK(strstr(sOut, "to stderr when asked") == NULL, "Nothing meant for stderr lands on stdout");
+    CHECK(strstr(sErr, "to stderr when asked") != NULL, "Screen output goes to stderr when asked");
+    CHECK(strstr(sErr, "stdout") == NULL, "Nothing meant for stdout lands on stderr");
+    return 0;
+}
+
 XTEST_MAIN(
     XTEST_CASE(api_paths),
+    XTEST_CASE(stderr),
     XTEST_CASE(filtering),
     XTEST_CASE(large_message),
     XTEST_CASE(severities),

@@ -145,6 +145,7 @@ typedef enum
 #define xlog_file(fl) XLog_FileLogSet(fl)
 #define xlog_indent(fl) XLog_IndentSet(fl)
 #define xlog_flush(fl) XLog_FlushSet(fl)
+#define xlog_stderr(fl) XLog_StdErrSet(fl)
 #define xlog_enable(fl) XLog_FlagEnable(fl)
 #define xlog_disable(fl) XLog_FlagDisable(fl)
 #define xlog_getfl(fl) XLog_FlagsGet(fl)
@@ -184,6 +185,7 @@ typedef struct XLogConfig {
 
     xbool_t bTraceTid;
     xbool_t bToScreen;
+    xbool_t bToStdErr;
     xbool_t bKeepOpen;
     xbool_t bUseHeap;
     xbool_t bRotate;
@@ -214,6 +216,7 @@ size_t XLog_NameSet(const char *pName);
 void XLog_ScreenLogSet(xbool_t bEnable);
 void XLog_FileLogSet(xbool_t bEnable);
 void XLog_FlushSet(xbool_t bEnable);
+void XLog_StdErrSet(xbool_t bEnable);
 void XLog_TraceTid(xbool_t bEnable);
 void XLog_UseHeap(xbool_t bEnable);
 void XLog_FlagsSet(uint16_t nFlags);

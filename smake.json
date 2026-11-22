@@ -59,7 +59,8 @@
             "./src/sys/xtime.c",
             "./src/sys/mon.c",
             "./src/sys/type.c",
-            "./src/sys/srch.c"
+            "./src/sys/srch.c",
+            "./src/sys/exec.c"
         ],
 
         "includes": [

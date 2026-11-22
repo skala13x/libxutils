@@ -26,6 +26,7 @@ OBJS = addr.$(OBJ) \
 	crc32.$(OBJ) \
 	crypt.$(OBJ) \
 	event.$(OBJ) \
+	exec.$(OBJ) \
 	hash.$(OBJ) \
 	hmac.$(OBJ) \
 	http.$(OBJ) \

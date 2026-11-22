@@ -275,8 +275,9 @@ static void XLog_DisplayMessage(const xlog_ctx_t *pCtx, const char *pInfo, size_
 
     if (pCfg->bToScreen && nCbVal > 0)
     {
-        printf("%s%s%s%s%s", pInfo, pSep, pMsg, pReset, pNewLine);
-        if (pCfg->bFlush) fflush(stdout);
+        FILE *pScreen = pCfg->bToStdErr ? stderr : stdout;
+        fprintf(pScreen, "%s%s%s%s%s", pInfo, pSep, pMsg, pReset, pNewLine);
+        if (pCfg->bFlush) fflush(pScreen);
     }
 
     if (!pCfg->bToFile || nCbVal < 0) return;
@@ -581,6 +582,14 @@ void XLog_FlushSet(xbool_t bEnable)
     XSync_Unlock(&g_xlog.lock);
 }
 
+void XLog_StdErrSet(xbool_t bEnable)
+{
+    XCHECK_VOID_NL(g_bInit);
+    XSync_Lock(&g_xlog.lock);
+    g_xlog.config.bToStdErr = bEnable;
+    XSync_Unlock(&g_xlog.lock);
+}
+
 void XLog_FileLogSet(xbool_t bEnable)
 {
     XCHECK_VOID_NL(g_bInit);
@@ -701,6 +710,7 @@ void XLog_Init(const char* pName, uint16_t nFlags, xbool_t bTdSafe)
 
     pCfg->bTraceTid = XFALSE;
     pCfg->bToScreen = XTRUE;
+    pCfg->bToStdErr = XFALSE;
     pCfg->bKeepOpen = XTRUE;
     pCfg->bUseHeap = XFALSE;
     pCfg->bToFile = XFALSE;

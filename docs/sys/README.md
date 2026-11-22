@@ -6,6 +6,7 @@ This section documents `xutils/src/sys/*`.
 
 - [cli.md](cli.md): terminal input, window rendering and progress bars
 - [cpu.md](cpu.md): CPU count and affinity helpers
+- [exec.md](exec.md): child processes with pollable standard streams, and a blocking runner
 - [log.md](log.md): global logger
 - [mon.md](mon.md): Linux process/system monitoring
 - [pool.md](pool.md): chained memory pool

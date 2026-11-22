@@ -37,7 +37,7 @@ if [[ "$MODE" == full ]]; then
         done < <(sed -n '/^The following tests FAILED:/,/^Errors while running CTest/p' "$FULL_LOG" |
             grep -E '^[[:space:]]+[0-9]+ - ' | sed -E 's/^[[:space:]]+//' || true)
     done
-    $TEST_ROOT/tests/report-coverage.py
+    "$TEST_ROOT/tests/report-coverage.py" "$FULL_ROOT/regressions-coverage"
     echo "==== full ===="
     printf '%s\n' "${FULL_REPORT[@]}"
     echo "Passed: ${FULL_PASSED[*]:-none}"
