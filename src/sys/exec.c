@@ -23,6 +23,11 @@ extern char **environ;
 
 #ifdef __linux__
 #include <sys/prctl.h>
+
+/* Called through syscall(): the libc wrapper (glibc 2.36) would raise the oldest libc a binary built here runs on */
+#if !defined(SYS_pidfd_open) && defined(__NR_pidfd_open)
+#define SYS_pidfd_open          __NR_pidfd_open
+#endif
 #endif
 
 #ifndef SIGKILL
@@ -45,6 +50,7 @@ void XExec_Init(xexec_t *pExec)
     pExec->nStdIn = XSOCK_INVALID;
     pExec->nStdOut = XSOCK_INVALID;
     pExec->nStdErr = XSOCK_INVALID;
+    pExec->nExitFd = XSOCK_INVALID;
     pExec->nPid = XSTDERR;
 
 #ifdef _WIN32
@@ -128,6 +134,20 @@ static void XExec_CloseFd(int *pFd)
     if (*pFd < 0) return;
     close(*pFd);
     *pFd = XSTDERR;
+}
+
+/* Opened for a child that has not been collected yet, so its id cannot have passed to anyone else - unless the
+   caller also collects any child (waitpid(-1)), which XExec_Wait cannot live with either. A pidfd is close-on-exec
+   from the start, and only ever waited on here: nothing is signalled through it. */
+static XSOCKET XExec_OpenExitFd(pid_t nPid)
+{
+#if defined(__linux__) && defined(SYS_pidfd_open)
+    long nFd = syscall(SYS_pidfd_open, nPid, 0U);
+    return nFd >= 0 ? (XSOCKET)nFd : XSOCK_INVALID;
+#else
+    (void)nPid;
+    return XSOCK_INVALID;
+#endif
 }
 
 /* Everything from 3 up: the caller's sockets and files are not the child's business, and a descriptor
@@ -321,6 +341,9 @@ XSTATUS XExec_Spawn(xexec_t *pExec, const xexec_opts_t *pOpts)
     pExec->nStdOut = nPipes[1][0];
     pExec->nStdErr = nPipes[2][0];
 
+    if (nFlags & XEXEC_EXIT_FD)
+        pExec->nExitFd = XExec_OpenExitFd(nPid);
+
     if (nFlags & XEXEC_NONBLOCK)
     {
         /* Best effort: a descriptor left blocking is still a working pipe */
@@ -407,6 +430,7 @@ void XExec_Close(xexec_t *pExec)
     XExec_CloseSock(&pExec->nStdIn);
     XExec_CloseSock(&pExec->nStdOut);
     XExec_CloseSock(&pExec->nStdErr);
+    XExec_CloseSock(&pExec->nExitFd);
 }
 
 #else /* _WIN32 */
@@ -994,7 +1018,8 @@ XSTATUS XExec_Run(const xexec_opts_t *pOpts, const uint8_t *pInput, size_t nInpu
 
     /* Its own group, so a timeout reaches everything the program started, and never outliving its caller */
     xexec_opts_t opts = *pOpts;
-    opts.nFlags |= XEXEC_STDIN | XEXEC_STDOUT | XEXEC_STDERR | XEXEC_NONBLOCK | XEXEC_GROUP | XEXEC_DIE_WITH_PARENT;
+    opts.nFlags |= XEXEC_STDIN | XEXEC_STDOUT | XEXEC_STDERR | XEXEC_NONBLOCK |
+                   XEXEC_GROUP | XEXEC_DIE_WITH_PARENT | XEXEC_EXIT_FD;
 
     pResult->nExitCode = XSTDERR;
     pResult->nSignal = 0;
@@ -1021,11 +1046,20 @@ XSTATUS XExec_Run(const xexec_opts_t *pOpts, const uint8_t *pInput, size_t nInpu
         uint64_t nStartMs = XTime_GetMonoMs();
         uint64_t nExitMs = 0;
         size_t nWritten = 0;
+        xbool_t bLost = XFALSE;
 
         for (;;)
         {
             uint64_t nNowMs = XTime_GetMonoMs();
-            if (!exec.bExited && XExec_Wait(&exec, 0) == XSTDOK) nExitMs = nNowMs;
+            XSTATUS nWait = exec.bExited ? XSTDOK : XExec_Wait(&exec, 0);
+            if (nWait == XSTDOK && !nExitMs) nExitMs = nNowMs;
+
+            /* Collected by someone else: there is no exit to wait for, and the id is no longer the child's */
+            if (nWait == XSTDERR)
+            {
+                bLost = XTRUE;
+                break;
+            }
 
             if (exec.bExited)
             {
@@ -1044,13 +1078,19 @@ XSTATUS XExec_Run(const xexec_opts_t *pOpts, const uint8_t *pInput, size_t nInpu
                 continue;
             }
 
-            xexec_pollfd_t fds[XEXEC_STREAMS];
-            XSOCKET *pFds[XEXEC_STREAMS];
+            xexec_pollfd_t fds[XEXEC_STREAMS + 1];
+            XSOCKET *pFds[XEXEC_STREAMS + 1];
             int nCount = 0;
 
             if (exec.nStdOut != XSOCK_INVALID) { pFds[nCount] = &exec.nStdOut; fds[nCount].events = POLLIN; nCount++; }
             if (exec.nStdErr != XSOCK_INVALID) { pFds[nCount] = &exec.nStdErr; fds[nCount].events = POLLIN; nCount++; }
             if (exec.nStdIn != XSOCK_INVALID) { pFds[nCount] = &exec.nStdIn; fds[nCount].events = POLLOUT; nCount++; }
+            if (exec.nExitFd != XSOCK_INVALID && !exec.bExited)
+            {
+                pFds[nCount] = &exec.nExitFd;
+                fds[nCount].events = POLLIN;
+                nCount++;
+            }
 
             if (!nCount)
             {
@@ -1075,6 +1115,12 @@ XSTATUS XExec_Run(const xexec_opts_t *pOpts, const uint8_t *pInput, size_t nInpu
                     XExec_Collect(&exec.nStdOut, &pResult->output, nMaxOutput, &pResult->bTruncated);
                 else if (pFds[i] == &exec.nStdErr)
                     XExec_Collect(&exec.nStdErr, &pResult->errors, nMaxOutput, &pResult->bTruncated);
+                else if (pFds[i] == &exec.nExitFd)
+                {
+                    /* The exit, collected here. One that still cannot be. a tracer holds it back, would keep this
+                       readable for good, so it is no longer polled and the wait at the top of each pass finds it. */
+                    if (XExec_Wait(&exec, 0) == XSTDNON) XExec_CloseSock(&exec.nExitFd);
+                }
                 else
                 {
                     int nSent = XExec_IoWrite(exec.nStdIn, pInput + nWritten, nInput - nWritten);
@@ -1086,7 +1132,7 @@ XSTATUS XExec_Run(const xexec_opts_t *pOpts, const uint8_t *pInput, size_t nInpu
             }
         }
 
-        if (!exec.bExited)
+        if (!exec.bExited && !bLost)
         {
             XExec_Kill(&exec, SIGKILL);
             XExec_Wait(&exec, XEXEC_RUN_KILL_WAIT_MS);

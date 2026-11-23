@@ -42,11 +42,12 @@ check_symbol_exists(close_range "unistd.h" XUTILS_HAVE_CLOSE_RANGE)
 unset(CMAKE_REQUIRED_DEFINITIONS)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND XUTILS_HAVE_CLOSE_RANGE)
     xutils_regression(exec_fault_regression sys spawn_failures nonblock_failures child_failures dupfd_failure descriptor_limits
-        wait_failures kill_paths run_io run_uncollectable)
+        wait_failures kill_paths run_io run_uncollectable exit_fd_faults)
     target_link_options(exec_fault_regression PRIVATE -Wl,--wrap=fork -Wl,--wrap=pipe2 -Wl,--wrap=pipe -Wl,--wrap=open
         -Wl,--wrap=fcntl -Wl,--wrap=dup2 -Wl,--wrap=setsid -Wl,--wrap=setgroups -Wl,--wrap=setgid -Wl,--wrap=setuid
         -Wl,--wrap=close_range -Wl,--wrap=sysconf -Wl,--wrap=prctl -Wl,--wrap=getppid -Wl,--wrap=waitpid -Wl,--wrap=kill
-        -Wl,--wrap=read -Wl,--wrap=__read_chk -Wl,--wrap=write -Wl,--wrap=XByteBuffer_Add -Wl,--wrap=sigpending)
+        -Wl,--wrap=read -Wl,--wrap=__read_chk -Wl,--wrap=write -Wl,--wrap=XByteBuffer_Add -Wl,--wrap=sigpending
+        -Wl,--wrap=syscall -Wl,--wrap=poll)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -327,7 +328,8 @@ if(UNIX)
         progress_bounds progress_output progress_animation input terminal_modes terminal_input read_bounds)
     xutils_regression(sig_regression sys register exit_handler errexit backtrace daemonize)
     xutils_regression(exec_regression sys null_args exit_status streams low_descriptors input start_failures workdir_env timeout output_cap
-        grace grace_stderr descriptors signals event_loop identity stream_choices lifecycle_edges die_with_parent)
+        grace grace_stderr descriptors signals event_loop identity stream_choices lifecycle_edges die_with_parent exit_fd
+        run_reaped_elsewhere)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         xutils_regression(cpu_regression sys count affinity guards)
         xutils_regression(cpu_fallback_regression sys count recovery)

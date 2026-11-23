@@ -18,6 +18,23 @@
 
 #define EXEC_SHELL "/bin/sh"
 
+#ifdef __linux__
+#include <sys/syscall.h>
+
+/* Whether this system hands out pidfds at all: a kernel before 5.3, or a Valgrind before 3.21, answers ENOSYS. */
+static int exec_have_pidfd(void)
+{
+#ifdef SYS_pidfd_open
+    long nFd = syscall(SYS_pidfd_open, getpid(), 0U);
+    if (nFd < 0) return 0;
+    close((int)nFd);
+    return 1;
+#else
+    return 0;
+#endif
+}
+#endif
+
 /* A child that ends before it reaches the program leaves through _exit(), which flushes nothing - except under
    Valgrind, whose exit path runs __libc_freeres() and writes out the stdio buffer the child inherited from this
    process. The harness's own pending output would then turn up as the child's. */
@@ -482,6 +499,12 @@ static int XTest_grace(void)
 
     CHECK(nStatus == XSTDOK && bOutput, "The program's own output is captured");
     CHECK(nElapsedMs < 2000, "A child left holding the output open is not waited for");
+
+    /* Not waited for beyond the grace, but waited for that long: what it writes inside the grace is kept */
+    nStatus = exec_run_sh("(sleep 0.1; echo late) & exit 0", NULL, 0, 0, 0, &result);
+    bOutput = exec_output_is(&result.output, "late\n");
+    XExec_ResultClear(&result);
+    CHECK(nStatus == XSTDOK && bOutput, "Output written within the grace after the exit is still captured");
     return 0;
 }
 
@@ -791,6 +814,97 @@ static int XTest_lifecycle_edges(void)
     return 0;
 }
 
+/* The exit as an event: nothing to poll for while the child runs with its streams closed, readable once it exits. */
+static int XTest_exit_fd(void)
+{
+    char *aArgv[] = { (char*)"sh", (char*)"-c", (char*)"exec >/dev/null 2>&1; read line; exit 3", NULL };
+    xexec_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.pPath = EXEC_SHELL;
+    opts.ppArgv = aArgv;
+    opts.nFlags = XEXEC_STDIN | XEXEC_STDOUT;
+
+    xexec_t exec;
+    CHECK(XExec_Spawn(&exec, &opts) == XSTDOK, "A child started without an exit descriptor");
+    CHECK(exec.nExitFd == XSOCK_INVALID, "No exit descriptor unless one is asked for");
+    XExec_CloseStdIn(&exec);
+    CHECK(XExec_Wait(&exec, 5000) == XSTDOK, "The child is collected as ever");
+    XExec_Close(&exec);
+
+#ifdef __linux__
+    if (!exec_have_pidfd())
+    {
+        fprintf(stderr, "exec_regression: no pidfds on this system; only the polling path is checked\n");
+        return 0;
+    }
+
+    opts.nFlags |= XEXEC_EXIT_FD;
+    CHECK(XExec_Spawn(&exec, &opts) == XSTDOK, "A child started with an exit descriptor");
+    CHECK(exec.nExitFd != XSOCK_INVALID, "The system gives an exit descriptor");
+    CHECK(fcntl(exec.nExitFd, F_GETFD) & FD_CLOEXEC, "The exit descriptor is not passed on to other programs");
+
+    /* Both output streams gone: from here on only the exit descriptor can tell the caller anything */
+    char sByte;
+    uint64_t nDeadlineMs = XTime_GetMonoMs() + 5000;
+    while (read(exec.nStdOut, &sByte, 1) > 0 && XTime_GetMonoMs() < nDeadlineMs) {}
+
+    struct pollfd exitPoll;
+    exitPoll.fd = exec.nExitFd;
+    exitPoll.events = POLLIN;
+    exitPoll.revents = 0;
+    CHECK(poll(&exitPoll, 1, 100) == 0, "A child that still runs leaves the exit descriptor quiet");
+    CHECK(XExec_Wait(&exec, 0) == XSTDNON, "A child that still runs is reported as running");
+
+    CHECK(write(exec.nStdIn, "go\n", 3) == 3, "The child is told to exit");
+    exitPoll.revents = 0;
+    CHECK(poll(&exitPoll, 1, 5000) == 1 && (exitPoll.revents & POLLIN), "The exit makes the descriptor readable");
+    CHECK(XExec_Wait(&exec, 0) == XSTDOK && exec.nExitCode == 3, "Once the descriptor is readable the exit is collected at once");
+
+    exitPoll.revents = 0;
+    CHECK(poll(&exitPoll, 1, 0) == 1 && (exitPoll.revents & POLLIN), "The descriptor stays readable once collected");
+
+    int nExitFd = exec.nExitFd;
+    XExec_Close(&exec);
+    CHECK(exec.nExitFd == XSOCK_INVALID, "Closing releases the exit descriptor");
+    CHECK(fcntl(nExitFd, F_GETFD) < 0 && errno == EBADF, "The exit descriptor is closed with the rest");
+
+    /* The runner waits on it: a program that closed its output is still collected with its own exit code */
+    xexec_result_t result;
+    CHECK(exec_run_sh("exec >/dev/null 2>&1; sleep 0.2; exit 5", NULL, 0, 0, 10000, &result) == XSTDOK,
+        "A run whose program closed its output completes");
+    CHECK(result.nExitCode == 5 && !result.bTimedOut, "The runner collects the exit through the descriptor");
+    XExec_ResultClear(&result);
+#endif
+    return 0;
+}
+
+/* A caller that ignores SIGCHLD has its children collected by the system: a run cannot wait for the exit, and must
+   neither spin until its timeout nor signal an id that may already be someone else's. */
+static int XTest_run_reaped_elsewhere(void)
+{
+#ifndef _WIN32
+    struct sigaction oldAction, ignAction;
+    memset(&ignAction, 0, sizeof(ignAction));
+    ignAction.sa_handler = SIG_IGN;
+    sigaction(SIGCHLD, &ignAction, &oldAction);
+
+    xexec_result_t result;
+    uint64_t nStartMs = XTime_GetMonoMs();
+    int nStatus = exec_run_sh("exit 0", NULL, 0, 0, 10000, &result);
+    uint64_t nElapsedMs = XTime_GetMonoMs() - nStartMs;
+    xbool_t bTimedOut = result.bTimedOut;
+    XExec_ResultClear(&result);
+    sigaction(SIGCHLD, &oldAction, NULL);
+
+    CHECK(nStatus == XSTDERR, "A child the system collected is reported as not collected");
+    CHECK(!bTimedOut, "The run ends when the wait is refused, not at its timeout");
+    CHECK(nElapsedMs < 5000, "The run does not spin until its timeout");
+    return 0;
+#else
+    return 77;
+#endif
+}
+
 /* The caller of a program started with XEXEC_DIE_WITH_PARENT goes away: the program goes with it. */
 static int XTest_die_with_parent(void)
 {
@@ -857,5 +971,7 @@ XTEST_MAIN(
     XTEST_CASE(identity),
     XTEST_CASE(stream_choices),
     XTEST_CASE(lifecycle_edges),
-    XTEST_CASE(die_with_parent)
+    XTEST_CASE(die_with_parent),
+    XTEST_CASE(exit_fd),
+    XTEST_CASE(run_reaped_elsewhere)
 )

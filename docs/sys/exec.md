@@ -4,8 +4,9 @@
 
 Starts child processes with their standard streams piped back to the caller, in two shapes:
 
-- an event-loop shape (`XExec_Spawn`, `XExec_Wait`, `XExec_Kill`, `XExec_Close`) whose pipe ends a poll loop or
-  `xapi_t` can wait on, and which never blocks the caller on the child;
+- an event-loop shape (`XExec_Spawn`, `XExec_Wait`, `XExec_Kill`, `XExec_Close`) whose pipe ends - and, on Linux,
+  the exit itself (`XEXEC_EXIT_FD`) - a poll loop or `xapi_t` can wait on, and which never blocks the caller on the
+  child;
 - a blocking runner (`XExec_Run`) that feeds input, captures both outputs up to a cap and enforces a timeout.
 
 ## Platform Notes
@@ -71,6 +72,17 @@ writes one line to its own stderr and exits the way a shell reports the same fai
     already gone. Windows: the job is `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the program and everything in its job
     go when the last handle to the job closes: when the caller exits, or on `XExec_Close`. A job that cannot be
     created or joined fails the spawn (`XSTDERR`) before the child has run. Other systems: no effect.
+  - `XEXEC_EXIT_FD`: `nExitFd` becomes readable once the child has exited, so an event loop can wait for the exit
+    instead of polling `XExec_Wait` for it - which matters for a program that has closed its output and so ends
+    with no end of file to announce it. Linux 5.3 and later: a pidfd, opened in the caller right after the fork,
+    while the child is still uncollected and its id still its own, and close-on-exec. (A caller that also collects
+    any child - `waitpid(-1)`, as `xapi_t` workers do - can take the child first; that breaks `XExec_Wait` too, and
+    is not a combination to use.) It is called through `syscall()`, so a binary
+    built against a newer libc still runs on an older one. Best effort: where the system has none, or refuses one
+    (`ENOSYS`, `EMFILE`), `nExitFd` stays `XSOCK_INVALID` and the spawn succeeds as without the flag. Readable
+    normally means `XExec_Wait(pExec, 0)` collects at once; a tracer can still hold the exit back, so treat readiness
+    as the moment to wait, never as the exit itself. It stays readable once the child has exited, so take it off a
+    level-triggered loop when it fires. Windows and other systems: always `XSOCK_INVALID`.
 - Windows only: `pCmdLine`, used verbatim instead of quoting `ppArgv` (`cmd.exe /c` has its own parsing rules).
 - POSIX only: `bSetIdentity`, `nUid`, `nGid`, `pGroups`, `nGroups`. The child sets the supplementary groups, then
   the gid, then the uid, before it changes directory. Resolve the account before the call: a name-service lookup
@@ -78,12 +90,13 @@ writes one line to its own stderr and exits the way a shell reports the same fai
 
 ### `void XExec_Init(xexec_t *pExec)`
 
-- Resets the handle: no streams (`XSOCK_INVALID`), no child (`nPid == XSTDERR`).
+- Resets the handle: no streams and no exit descriptor (`XSOCK_INVALID`), no child (`nPid == XSTDERR`).
 
 ### `XSTATUS XExec_Spawn(xexec_t *pExec, const xexec_opts_t *pOpts)`
 
 - Returns:
-  - `XSTDOK` when the child exists; the caller's ends are in `nStdIn`, `nStdOut`, `nStdErr`.
+  - `XSTDOK` when the child exists; the caller's ends are in `nStdIn`, `nStdOut`, `nStdErr`, and with
+    `XEXEC_EXIT_FD` the exit descriptor, when the system gave one, in `nExitFd`.
   - `XSTDINV` for missing arguments, an empty `pPath`, or groups without a group list.
   - `XSTDERR` when pipes, the null device or the process could not be created; `errno` / `GetLastError()` says why.
 
@@ -112,9 +125,11 @@ writes one line to its own stderr and exits the way a shell reports the same fai
 
 ### `void XExec_Close(xexec_t *pExec)`
 
-- Closes the caller's ends and, on Windows, stops the pump threads and releases the process and job handles.
+- Closes the caller's ends, `nExitFd` included, and, on Windows, stops the pump threads and releases the process and
+  job handles.
 - Neither waits for nor kills the child: kill and collect it first when it must be gone.
-- A stream handed to an owner that closes it (an `xapi_t` endpoint, for one) must be set to `XSOCK_INVALID` first.
+- A descriptor handed to an owner that closes it (an `xapi_t` endpoint, for one) must be set to `XSOCK_INVALID`
+  first.
 
 ### `XSTATUS XExec_Run(...)`
 
@@ -124,7 +139,9 @@ XSTATUS XExec_Run(const xexec_opts_t *pOpts, const uint8_t *pInput, size_t nInpu
 ```
 
 - Always pipes all three streams, makes them non-blocking and runs the child in its own group with
-  `XEXEC_DIE_WITH_PARENT` (`XEXEC_MERGE_STDERR` is honoured).
+  `XEXEC_DIE_WITH_PARENT` (`XEXEC_MERGE_STDERR` is honoured). Where the system has one it waits on the exit
+  descriptor (`XEXEC_EXIT_FD`) next to the streams, so the exit is collected the moment it happens, also for a
+  program that closed its output early; without one it polls, as before.
 - Writes `pInput`, then closes stdin; a child that stops reading ends the writing without a `SIGPIPE` reaching
   the caller (held back for the calling thread during the run and taken if it came).
 - Keeps the first `nMaxOutput` bytes of each stream (`0`: everything) and keeps draining past that, so a chatty
@@ -133,7 +150,9 @@ XSTATUS XExec_Run(const xexec_opts_t *pOpts, const uint8_t *pInput, size_t nInpu
 - A child that exits while something it started still holds its output open is not waited for beyond a short
   grace (250 ms).
 - Returns `XSTDOK` when the child ran and was collected, whatever its exit code; `XSTDERR` when it could not be
-  started or collected. Release the buffers with `XExec_ResultClear`.
+  started or collected. A wait the system refuses - a caller that ignores `SIGCHLD` has its children collected by
+  the kernel - ends the run at once instead of spinning until the timeout, and nothing is signalled after it: the
+  id may already belong to another process. Release the buffers with `XExec_ResultClear`.
 
 ## Coverage Builds
 

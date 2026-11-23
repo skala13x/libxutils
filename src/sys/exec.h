@@ -50,6 +50,17 @@ extern "C" {
 */
 #define XEXEC_DIE_WITH_PARENT   (1U << 6)
 
+/*
+    nExitFd becomes readable once the child has exited, so an event loop can
+    wait for the exit instead of polling XExec_Wait for it: a pidfd, on Linux
+    5.3 and later. Best effort - where the system has none or refuses one,
+    nExitFd stays XSOCK_INVALID and XExec_Wait finds the exit as it always
+    does. Readable normally means XExec_Wait(pExec, 0) collects at once; a
+    tracer can still hold the exit back, so readiness is a hint to wait now,
+    not a substitute for the wait. It never becomes unreadable again.
+*/
+#define XEXEC_EXIT_FD           (1U << 7)
+
 /* Exit codes of a child that never ran the program, as shells report them */
 #define XEXEC_EXIT_NOEXEC       126     /* Found, but could not be executed */
 #define XEXEC_EXIT_NOTFOUND     127     /* Missing program, identity or working directory */
@@ -93,8 +104,9 @@ typedef struct XExec {
     XSOCKET nStdIn;
     XSOCKET nStdOut;
     XSOCKET nStdErr;
+    XSOCKET nExitFd;            /* XEXEC_EXIT_FD: readable once the child has exited, XSOCK_INVALID without one */
 
-    xpid_t nPid;                /* Valid while running, XSTDERR before a spawn and after a failed one */
+    xpid_t nPid;               /* Valid while running, XSTDERR before a spawn and after a failed one */
     int nExitCode;              /* Once bExited: the exit status, or 128 + the signal that ended it */
     int nSignal;                /* POSIX, once bExited: the signal that ended it, 0 for a normal exit */
     xbool_t bExited;
@@ -140,10 +152,11 @@ XSTATUS XExec_Kill(xexec_t *pExec, int nSignal);
 void XExec_CloseStdIn(xexec_t *pExec);
 
 /*
-    Releases the caller's ends and handles. Neither waits for nor kills the
-    child: a caller that wants it gone kills and collects it first. A stream
-    the caller has handed to an owner that closes it (an event loop) is set to
-    XSOCK_INVALID beforehand so that it is not closed twice.
+    Releases the caller's ends and handles, nExitFd included. Neither waits
+    for nor kills the child: a caller that wants it gone kills and collects it
+    first. A descriptor the caller has handed to an owner that closes it (an
+    event loop) is set to XSOCK_INVALID beforehand so that it is not closed
+    twice.
 */
 void XExec_Close(xexec_t *pExec);
 
@@ -163,10 +176,14 @@ void XExec_ResultClear(xexec_result_t *pResult);
     Runs the program to completion: feeds it pInput (then end of file), keeps
     the first nMaxOutput bytes of each output stream (0 keeps everything) and
     kills its group once it outlives nTimeoutMs (0 waits as long as it takes).
-    The program runs with XEXEC_GROUP and XEXEC_DIE_WITH_PARENT.
+    The program runs with XEXEC_GROUP and XEXEC_DIE_WITH_PARENT, and its exit
+    is waited for on XEXEC_EXIT_FD where the system has one.
     A child that exits while something it started still holds its output open
     is not waited for beyond a short grace. Blocks the caller throughout.
-    XSTDOK when the child ran and was collected, whatever its exit code.
+    XSTDOK when the child ran and was collected, whatever its exit code,
+    XSTDERR when it was not. A wait the system refuses - the child collected
+    by someone else - ends the run at once and nothing is signalled after it:
+    the id may already belong to another process.
 */
 XSTATUS XExec_Run(const xexec_opts_t *pOpts, const uint8_t *pInput, size_t nInput,
                   size_t nMaxOutput, int nTimeoutMs, xexec_result_t *pResult);

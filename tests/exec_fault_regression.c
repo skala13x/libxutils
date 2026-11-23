@@ -14,9 +14,11 @@
 #include "xtime.h"
 #include <dirent.h>
 #include <grp.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -53,6 +55,10 @@ typedef struct {
     int nWriteFaults;
     xbool_t bBufferFails;
     xbool_t bPendingFails;
+    xbool_t bExitFdFails;       /* pidfd_open() answers ENOSYS, as a kernel older than 5.3 does */
+    int nKillCalls;             /* kill() calls made by the caller */
+    int nWaitCalls;             /* waitpid() calls made by the caller: how often an exit was polled for */
+    int nPollCalls;             /* poll() calls made by the caller: how often the runner's loop went round */
 } exec_fault_t;
 
 static exec_fault_t g_fault;
@@ -93,6 +99,8 @@ ssize_t __real___read_chk(int, void*, size_t, size_t);
 ssize_t __real_write(int, const void*, size_t);
 int __real_XByteBuffer_Add(xbyte_buffer_t*, const uint8_t*, size_t);
 int __real_sigpending(sigset_t*);
+long __real_syscall(long, ...);
+int __real_poll(struct pollfd*, nfds_t, int);
 
 pid_t __wrap_fork(void)
 {
@@ -225,6 +233,7 @@ pid_t __wrap_getppid(void)
 
 pid_t __wrap_waitpid(pid_t nPid, int *pStatus, int nOptions)
 {
+    if (fault_owner()) g_fault.nWaitCalls++;
     if (fault_owner() && g_fault.nWaitEintr > 0) { g_fault.nWaitEintr--; errno = EINTR; return -1; }
     if (fault_owner() && g_fault.nWaitErrno) { errno = g_fault.nWaitErrno; return -1; }
     if (fault_owner() && g_fault.bWaitNever && (nOptions & WNOHANG)) return 0;
@@ -233,6 +242,7 @@ pid_t __wrap_waitpid(pid_t nPid, int *pStatus, int nOptions)
 
 int __wrap_kill(pid_t nPid, int nSignal)
 {
+    if (fault_owner()) g_fault.nKillCalls++;
     if (fault_owner() && nPid < 0 && g_fault.nGroupKillErrno) { errno = g_fault.nGroupKillErrno; return -1; }
     if (fault_owner() && nPid > 0 && g_fault.nKillErrno) { errno = g_fault.nKillErrno; return -1; }
     return __real_kill(nPid, nSignal);
@@ -301,6 +311,25 @@ int __wrap_sigpending(sigset_t *pSet)
     return __real_sigpending(pSet);
 }
 
+int __wrap_poll(struct pollfd *pFds, nfds_t nCount, int nTimeoutMs)
+{
+    if (fault_owner()) g_fault.nPollCalls++;
+    return __real_poll(pFds, nCount, nTimeoutMs);
+}
+
+/* Every argument travels as the word the kernel takes, six of them, the way glibc's own syscall() reads them */
+long __wrap_syscall(long nNumber, ...)
+{
+    va_list args;
+    va_start(args, nNumber);
+    long nArgs[6];
+    for (int i = 0; i < 6; i++) nArgs[i] = va_arg(args, long);
+    va_end(args);
+
+    if (nNumber == SYS_pidfd_open && fault_owner() && g_fault.bExitFdFails) { errno = ENOSYS; return -1; }
+    return __real_syscall(nNumber, nArgs[0], nArgs[1], nArgs[2], nArgs[3], nArgs[4], nArgs[5]);
+}
+
 /* ---- helpers ---------------------------------------------------------------------------------------- */
 
 static int open_fds(void)
@@ -323,6 +352,15 @@ static int mask_is(const sigset_t *pExpected)
     pthread_sigmask(SIG_SETMASK, NULL, &current);
     for (int nSig = 1; nSig < SIGRTMIN; nSig++)
         if (sigismember(&current, nSig) != sigismember(pExpected, nSig)) return 0;
+    return 1;
+}
+
+/* Whether this system hands out pidfds at all: a kernel before 5.3, or a Valgrind before 3.21, answers ENOSYS. */
+static int have_pidfd(void)
+{
+    long nFd = __real_syscall(SYS_pidfd_open, getpid(), 0U);
+    if (nFd < 0) return 0;
+    close((int)nFd);
     return 1;
 }
 
@@ -749,6 +787,97 @@ static int XTest_run_uncollectable(void)
     return 0;
 }
 
+/* The exit descriptor refused, or readable for an exit the wait cannot collect, or the wait refused altogether */
+static int XTest_exit_fd_faults(void)
+{
+    char *aArgv[4];
+    xexec_opts_t opts;
+    sh_opts(&opts, aArgv, "exit 4");
+    opts.nFlags = XEXEC_EXIT_FD;
+    xexec_t exec;
+
+    /* A kernel without pidfd: the spawn still succeeds, and the exit is found by waiting as ever */
+    fault_reset();
+    g_fault.bExitFdFails = XTRUE;
+    int nFdsBefore = open_fds();
+    CHECK(XExec_Spawn(&exec, &opts) == XSTDOK, "A spawn succeeds when the exit descriptor is refused");
+    CHECK(exec.nExitFd == XSOCK_INVALID, "A refused exit descriptor is left invalid");
+    CHECK(XExec_Wait(&exec, 5000) == XSTDOK && exec.nExitCode == 4, "The child is collected without it");
+    XExec_Close(&exec);
+    CHECK(open_fds() == nFdsBefore, "Nothing is left open");
+
+    xexec_result_t result;
+    fault_reset();
+    g_fault.bExitFdFails = XTRUE;
+    CHECK(run_sh("exec >/dev/null 2>&1; sleep 0.1; exit 6", 0, &result) == XSTDOK && result.nExitCode == 6,
+        "A run without an exit descriptor still collects a program that closed its output");
+    XExec_ResultClear(&result);
+
+    /* With one, a program that closed its output is waited for, not polled for: a wait every 20 ms step at most, where
+       polling would ask every 2 ms */
+    fault_reset();
+    CHECK(run_sh("exec >/dev/null 2>&1; sleep 0.3; exit 3", 0, &result) == XSTDOK && result.nExitCode == 3,
+        "A run with an exit descriptor collects a program that closed its output");
+    int nWaits = g_fault.nWaitCalls;
+    XExec_ResultClear(&result);
+    CHECK(nWaits < 60 || !have_pidfd(), "The exit of a program that closed its output is waited for on its descriptor, "
+        "not polled for");
+
+    /* Collected, the exit descriptor - readable for good - leaves the poll set: the grace for output something the
+       program started still holds open is waited out in 20 ms steps, never spun through */
+    fault_reset();
+    CHECK(run_sh("sleep 2 & echo started", 0, &result) == XSTDOK && result.nExitCode == 0, "A run with a grace completes");
+    int nPolls = g_fault.nPollCalls;
+    XExec_ResultClear(&result);
+    CHECK(nPolls < 100, "The grace after an exit is waited out, not spun through on the exit descriptor");
+
+    /* Readable, but the exit cannot be collected (a tracer would hold it): no longer polled, bounded by the timeout */
+    fault_reset();
+    g_fault.bWaitNever = XTRUE;
+    nFdsBefore = open_fds();
+    char *aRunArgv[4];
+    xexec_opts_t runOpts;
+    sh_opts(&runOpts, aRunArgv, "exit 0");
+    XExec_ResultInit(&result);
+    uint64_t nStartMs = XTime_GetMonoMs();
+    XSTATUS nStatus = XExec_Run(&runOpts, NULL, 0, 0, 300, &result);
+    uint64_t nElapsedMs = XTime_GetMonoMs() - nStartMs;
+    nWaits = g_fault.nWaitCalls;
+    XExec_ResultClear(&result);
+    fault_reset();
+
+    int nStatusCode = 0;
+    while (__real_waitpid(-1, &nStatusCode, WNOHANG) > 0) {}
+
+    CHECK(nStatus == XSTDERR, "An exit that cannot be collected fails the run");
+    CHECK(nElapsedMs < 15000, "An exit that cannot be collected is given up on in bounded time");
+
+    /* Bounded by time - 300 ms of 2 ms steps, then the 5 s wait after the kill - where a descriptor left polled would
+       turn the loop into a spin of a wait per pass */
+    CHECK(nWaits < 10000, "A readable exit descriptor with nothing to collect does not keep the run spinning");
+    CHECK(open_fds() == nFdsBefore, "The exit descriptor is closed with the rest");
+
+    /* The wait refused: the run stops at once, and signals nobody */
+    fault_reset();
+    g_fault.nWaitErrno = ECHILD;
+    XExec_ResultInit(&result);
+    nStartMs = XTime_GetMonoMs();
+    nStatus = XExec_Run(&runOpts, NULL, 0, 0, 10000, &result);
+    nElapsedMs = XTime_GetMonoMs() - nStartMs;
+    int nKills = g_fault.nKillCalls;
+    xbool_t bTimedOut = result.bTimedOut;
+    XExec_ResultClear(&result);
+    fault_reset();
+    while (__real_waitpid(-1, &nStatusCode, 0) > 0) {}
+
+    CHECK(nStatus == XSTDERR && !bTimedOut, "A refused wait ends the run as not collected, not as timed out");
+    CHECK(nKills == 0, "A child that may have been collected elsewhere is never signalled");
+    CHECK(nElapsedMs < 5000, "A refused wait does not keep the run going until its timeout");
+
+    fault_reset();
+    return 0;
+}
+
 XTEST_MAIN(
     XTEST_CASE(spawn_failures),
     XTEST_CASE(nonblock_failures),
@@ -758,5 +887,6 @@ XTEST_MAIN(
     XTEST_CASE(wait_failures),
     XTEST_CASE(kill_paths),
     XTEST_CASE(run_io),
-    XTEST_CASE(run_uncollectable)
+    XTEST_CASE(run_uncollectable),
+    XTEST_CASE(exit_fd_faults)
 )
