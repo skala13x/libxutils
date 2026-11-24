@@ -124,36 +124,43 @@ char *XBase64_Encrypt(const uint8_t *pInput, size_t *pLength)
     return pEncodedData;
 }
 
-char *XBase64_Decrypt(const uint8_t *pInput, size_t *pLength)
+/* Whether nLength bytes of pInput are base64 the decoders take: what they decode to in pOutLength,
+    and the length the decoding walks - the padding a short last group leaves out counted in - in pPaddedLength */
+static xbool_t XBase64_DecodeSize(const uint8_t *pInput, size_t nLength, size_t *pOutLength, size_t *pPaddedLength)
 {
-    XCHECK((pInput && pLength && (*pLength)), NULL);
-    size_t i, j, nLength = *pLength, nExplicitPad = 0;
+    size_t i, nExplicitPad = 0;
 
     while (nExplicitPad < nLength && pInput[nLength - 1 - nExplicitPad] == '=')
         nExplicitPad++;
 
-    if (nExplicitPad > 2) return NULL;
-    if (nExplicitPad > 0 && (nLength % 4) != 0) return NULL;
+    if (nExplicitPad > 2) return XFALSE;
+    if (nExplicitPad > 0 && (nLength % 4) != 0) return XFALSE;
 
     for (i = 0; i < nLength - nExplicitPad; i++)
     {
         if (pInput[i] == '=' || XBase64_DecodeValue(pInput[i]) < 0)
-            return NULL;
+            return XFALSE;
     }
 
     size_t nRemainder = nLength % 4;
-    if (nRemainder == 1) return NULL;
+    if (nRemainder == 1) return XFALSE;
 
     size_t nImplicitPad = (nExplicitPad == 0 && nRemainder != 0) ? (4 - nRemainder) : 0;
     size_t nPaddedLength = nLength + nImplicitPad;
     size_t nOutLength = (nPaddedLength / 4) * 3;
     size_t nPad = nExplicitPad + nImplicitPad;
 
-    if (nPad > nOutLength) return NULL;
-    nOutLength -= nPad;
+    if (nPad > nOutLength) return XFALSE;
+    *pOutLength = nOutLength - nPad;
+    *pPaddedLength = nPaddedLength;
+    return XTRUE;
+}
 
-    char *pDecodedData = (char *)calloc(1, nOutLength + 1);
-    XCHECK(pDecodedData, NULL);
+/* Writes the nOutLength bytes base64 that XBase64_DecodeSize took decodes to */
+static xbool_t XBase64_DecodeInto(const uint8_t *pInput, size_t nLength, size_t nPaddedLength,
+                                  uint8_t *pOutput, size_t nOutLength)
+{
+    size_t i, j;
 
     for (i = 0, j = 0; i < nPaddedLength; i += 4)
     {
@@ -169,11 +176,7 @@ char *XBase64_Decrypt(const uint8_t *pInput, size_t *pLength)
             }
 
             int nValue = XBase64_DecodeValue(pInput[nIndex]);
-            if (nValue < 0)
-            {
-                free(pDecodedData);
-                return NULL;
-            }
+            if (nValue < 0) return XFALSE;
 
             nSextets[k] = (uint32_t)nValue;
         }
@@ -181,12 +184,24 @@ char *XBase64_Decrypt(const uint8_t *pInput, size_t *pLength)
         uint32_t nTriple = (nSextets[0] << 3 * 6) + (nSextets[1] << 2 * 6)
                          + (nSextets[2] << 1 * 6) + (nSextets[3] << 0 * 6);
 
-        if (j < nOutLength) pDecodedData[j++] = (nTriple >> 2 * 8) & 0xFF;
-        if (j < nOutLength) pDecodedData[j++] = (nTriple >> 1 * 8) & 0xFF;
-        if (j < nOutLength) pDecodedData[j++] = (nTriple >> 0 * 8) & 0xFF;
+        if (j < nOutLength) pOutput[j++] = (nTriple >> 2 * 8) & 0xFF;
+        if (j < nOutLength) pOutput[j++] = (nTriple >> 1 * 8) & 0xFF;
+        if (j < nOutLength) pOutput[j++] = (nTriple >> 0 * 8) & 0xFF;
     }
 
-    if (j != nOutLength)
+    return j == nOutLength ? XTRUE : XFALSE;
+}
+
+char *XBase64_Decrypt(const uint8_t *pInput, size_t *pLength)
+{
+    XCHECK((pInput && pLength && (*pLength)), NULL);
+    size_t nOutLength = 0, nPaddedLength = 0;
+    if (!XBase64_DecodeSize(pInput, *pLength, &nOutLength, &nPaddedLength)) return NULL;
+
+    char *pDecodedData = (char *)calloc(1, nOutLength + 1);
+    XCHECK(pDecodedData, NULL);
+
+    if (!XBase64_DecodeInto(pInput, *pLength, nPaddedLength, (uint8_t*)pDecodedData, nOutLength))
     {
         free(pDecodedData);
         return NULL;
@@ -196,6 +211,19 @@ char *XBase64_Decrypt(const uint8_t *pInput, size_t *pLength)
     pDecodedData[*pLength] = '\0';
 
     return pDecodedData;
+}
+
+xbool_t XBase64_DecryptTo(const uint8_t *pInput, size_t nLength, uint8_t *pOutput, size_t nSize, size_t *pOutLength)
+{
+    XCHECK_NL((pInput && nLength && pOutput && pOutLength), XFALSE);
+    size_t nOutLength = 0, nPaddedLength = 0;
+
+    /* Refused before a byte is written when it is not base64 or does not fit: a refusal leaves pOutput as it was */
+    if (!XBase64_DecodeSize(pInput, nLength, &nOutLength, &nPaddedLength) || nOutLength > nSize) return XFALSE;
+    if (!XBase64_DecodeInto(pInput, nLength, nPaddedLength, pOutput, nOutLength)) return XFALSE;
+
+    *pOutLength = nOutLength;
+    return XTRUE;
 }
 
 char *XBase64_UrlDecrypt(const uint8_t *pInput, size_t *pLength)

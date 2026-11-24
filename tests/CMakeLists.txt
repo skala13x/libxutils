@@ -214,7 +214,7 @@ xutils_regression(json_regression data null_args api_guards parse_matrix parse_b
     unicode_escapes float_text writer_failures)
 xutils_regression(json_limits_regression data boundaries escape_nul pool_dump)
 xutils_regression(str_buf_regression data boundaries)
-xutils_regression(base64_regression crypt boundaries length_overflow)
+xutils_regression(base64_regression crypt boundaries length_overflow decrypt_to)
 xutils_regression(sha_regression crypt null_args sha256_vectors sha256_streaming sha1_vectors md5_vectors crc32_vectors hmac_vectors)
 if(OPENSSL_FOUND)
     xutils_regression(digest_regression crypt boundaries sha256_raw_final hmac_variants)
